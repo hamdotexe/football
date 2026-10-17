@@ -25,6 +25,7 @@
 # This notebook is CPU-only: it downloads, converts and resizes. No GPU needed.
 
 # %%
+!pip install -q supervision
 import os, shutil, subprocess, sys
 print("free disk in /tmp: %.0f GB" % (shutil.disk_usage("/tmp").free / 1e9))
 print("free disk in /kaggle/working: %.0f GB" % (shutil.disk_usage("/kaggle/working").free / 1e9))
