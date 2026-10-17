@@ -27,3 +27,6 @@ Thumbs.db
 
 # Kaggle notebook builds
 notebooks/**/*.ipynb
+
+# Secrets (API keys) — never commit
+.env
