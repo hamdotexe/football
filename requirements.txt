@@ -1,6 +1,7 @@
 # Core deep learning + detection
 ultralytics>=8.3        # YOLO models: training + inference (pulls in torch)
-supervision>=0.25       # trackers (ByteTrack), drawing/annotation helpers, video I/O
+supervision>=0.25       # drawing/annotation helpers, video I/O, metrics
+trackers>=2.6           # ByteTrack / BoT-SORT multi-object trackers
 
 # Computer vision / maths
 opencv-python>=4.10     # video reading/writing, homography (cv2.findHomography)
