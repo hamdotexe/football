@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Big files: never commit data, weights or rendered videos
+data/
+models/
+outputs/
+runs/
+*.mp4
+*.avi
+*.mkv
+*.pt
+*.onnx
+
+# Keep empty folders in the repo
+!data/.gitkeep
+!models/.gitkeep
+!outputs/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

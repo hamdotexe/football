@@ -1,0 +1,17 @@
+# Core deep learning + detection
+ultralytics>=8.3        # YOLO models: training + inference (pulls in torch)
+supervision>=0.25       # trackers (ByteTrack), drawing/annotation helpers, video I/O
+
+# Computer vision / maths
+opencv-python>=4.10     # video reading/writing, homography (cv2.findHomography)
+numpy
+scikit-learn            # KMeans for team clustering
+umap-learn              # dimensionality reduction before clustering
+
+# Team classification embeddings (SigLIP)
+transformers
+sentencepiece
+
+# Utilities
+tqdm                    # progress bars
+gdown                   # download sample videos / weights from Google Drive
