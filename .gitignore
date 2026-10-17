@@ -5,9 +5,9 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Big files: never commit data, weights or rendered videos
-data/
-models/
-outputs/
+data/*
+models/*
+outputs/*
 runs/
 *.mp4
 *.avi
