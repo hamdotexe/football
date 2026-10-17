@@ -1,0 +1,15 @@
+{
+  "id": "hamzadotexe/football-train-detector",
+  "title": "football-train-detector",
+  "code_file": "train_detector.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["hamzadotexe/football-players-roboflow-1280"],
+  "competition_sources": [],
+  "kernel_sources": ["hamzadotexe/soccernet-yolo-dataset"],
+  "model_sources": []
+}
