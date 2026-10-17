@@ -171,3 +171,18 @@ def refine_homography(H_pitch_to_img, observations, player_pairs=None, player_we
     H = np.append(fit.x, 1.0).reshape(3, 3)
     line_err = _line_residuals(H, observations)
     return H, line_err
+
+
+# --- Inference: predicted keypoints -> homography ----------------------------------------------------------------
+def homography_from_keypoints(kp_xy, kp_conf, conf_threshold=0.5, ransac_px=10.0):
+    """Image->pitch homography from detected pitch keypoints (33 x 2 pixel coords + 33 confidences).
+
+    Returns (H_img_to_pitch, n_inliers) or (None, 0) when fewer than 4 confident keypoints are found.
+    """
+    keep = np.asarray(kp_conf) >= conf_threshold
+    if keep.sum() < 4:
+        return None, 0
+    H, mask = cv2.findHomography(np.float64(kp_xy)[keep], KEYPOINT_XY[keep], cv2.RANSAC, ransac_px)
+    if H is None:
+        return None, 0
+    return H, int(mask.sum())
