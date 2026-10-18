@@ -72,5 +72,6 @@ def test_augmentation_keeps_ball_label_on_the_ball(seed):
     x, heat, target = ds[0]
     assert target[2] == 1
     bx, by = int(round(target[0].item())), int(round(target[1].item()))
-    assert x[3:6, by, bx].max() > 0.5                    # middle frame is bright exactly at the label
+    assert x.dtype == torch.uint8
+    assert x[3:6, by, bx].max() == 255                   # middle frame is bright exactly at the label
     assert heat[0, by, bx] == 1.0

@@ -65,14 +65,16 @@ class Config:
     batch: int = 16
     crop: tuple[int, int] = (384, 640)
     epoch_samples: int = 40_000
-    lr: float = 1e-3
+    lr: float = 5e-4
+    init: str | None = None                 # start from these weights (e.g. a previous run's best)
     widths: tuple[int, ...] = (32, 64, 128, 256)
     val_clips: int = 6
     eval_stride: int = 5                    # validate/test on every 5th frame
     workers: int = os.cpu_count() or 4
     detector: str | None = None             # YOLO weights to compare on the same test frames
     min_free_disk_gb: float = 60.0
-    min_samples_per_sec: float = 30.0
+    min_samples_per_sec: float = 20.0
+    max_bad_steps_in_row: int = 5            # non-finite losses tolerated in a row before stopping
     smoke: bool = False
 
 
@@ -174,7 +176,7 @@ def extract_and_verify(ref: ZipRef, samples: list[Sample], root: Path, workers: 
 
 
 def check_first_batch(x: torch.Tensor, heat: torch.Tensor, target: torch.Tensor) -> None:
-    check(bool(torch.isfinite(x).all()) and x.min() >= 0 and x.max() <= 1, "input frames are not in [0, 1]")
+    check(x.dtype == torch.uint8 and x.shape[1] == 9, f"input should be uint8 with 9 channels, got {x.dtype} {tuple(x.shape)}")
     has_ball = target[:, 2] == 1
     peaks = heat.amax(dim=(1, 2, 3))
     check(bool(torch.all(peaks[has_ball] == 1)), "heatmap peak is not 1.0 for a sample that has a ball")
@@ -187,6 +189,37 @@ def autocast(device: str, dtype: torch.dtype):
     return torch.autocast(device_type="cuda", dtype=dtype, enabled=device == "cuda")
 
 
+def to_input(x: torch.Tensor, device: str, augment: bool) -> torch.Tensor:
+    """uint8 frames -> float [0, 1] on the GPU; training adds per-sample brightness/contrast jitter (same for all 3 frames)."""
+    x = x.to(device, non_blocking=True).float().div_(255)
+    if augment:
+        n = x.shape[0]
+        gain = torch.empty(n, 1, 1, 1, device=device).uniform_(0.8, 1.2)
+        bias = torch.empty(n, 1, 1, 1, device=device).uniform_(-0.08, 0.08)
+        x = (x * gain + bias).clamp_(0, 1)
+    return x.contiguous(memory_format=torch.channels_last)
+
+
+def benchmark(loader: DataLoader, model: nn.Module, device: str, dtype: torch.dtype, batches: int = 20) -> None:
+    """Log data-loading speed vs GPU speed, so the bottleneck is measured rather than guessed."""
+    it, t = iter(loader), time.time()
+    batch = [next(it) for _ in range(batches)]
+    load_rate = batches * batch[0][0].shape[0] / (time.time() - t)
+    x, heat = to_input(batch[0][0], device, True), batch[0][1].to(device)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    t = time.time()
+    for _ in range(batches):
+        with autocast(device, dtype):
+            focal_loss(model(x), heat).backward()
+    if device == "cuda":
+        torch.cuda.synchronize()
+    gpu_rate = batches * x.shape[0] / (time.time() - t)
+    model.zero_grad(set_to_none=True)
+    log.info("benchmark: data loader %.0f samples/s | GPU forward+backward %.0f samples/s -> bottleneck: %s",
+             load_rate, gpu_rate, "data loading (CPU)" if load_rate < gpu_rate else "GPU")
+
+
 @torch.no_grad()
 def predict(model: nn.Module, loader: DataLoader, device: str, dtype: torch.dtype, stop_at: float):
     """Peak (x, y, confidence) per frame. Stops early (returns complete=False) if the wall clock passes `stop_at`."""
@@ -194,7 +227,7 @@ def predict(model: nn.Module, loader: DataLoader, device: str, dtype: torch.dtyp
     preds, truths = [], []
     for x, _, target in loader:
         with autocast(device, dtype):
-            logits = model(x.to(device, non_blocking=True).to(memory_format=torch.channels_last))
+            logits = model(to_input(x, device, augment=False))
         preds += decode(logits, threshold=0.0)
         truths += [(a, b) if has else None for a, b, has in target.tolist()]
         if time.time() > stop_at:
@@ -219,7 +252,10 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda" and dtype == torch.float16)   # fp16 needs loss scaling
+    if not cfg.smoke:
+        benchmark(train_dl, model, device, dtype)
     start, step, epoch, losses = time.time(), 0, 0, []
+    bad_total = bad_in_row = 0
     best = {"f1": -1.0}
     history = []
 
@@ -232,12 +268,20 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
             lr = lr_at((time.time() - start) / budget, step, cfg)
             for g in opt.param_groups:
                 g["lr"] = lr
-            x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            x = to_input(x, device, augment=True)
             heat = heat.to(device, non_blocking=True)
             with autocast(device, dtype):
                 loss = focal_loss(model(x), heat)
-            check(bool(torch.isfinite(loss)), f"loss is {loss.item()} at step {step} (lr {lr:.1e}): training diverged")
             opt.zero_grad(set_to_none=True)
+            if not torch.isfinite(loss):
+                # an isolated overflow (fp16) is skipped, like GradScaler skips inf gradients; repeated ones stop the run
+                bad_total, bad_in_row = bad_total + 1, bad_in_row + 1
+                log.warning("non-finite loss at step %d (lr %.1e): batch skipped (%d in a row, %d total)",
+                            step, lr, bad_in_row, bad_total)
+                check(bad_in_row < cfg.max_bad_steps_in_row, f"loss non-finite {bad_in_row} steps in a row: training diverged")
+                check(bad_total <= max(20, 0.01 * step), f"loss non-finite on {bad_total} of {step} steps: training unstable")
+                continue
+            bad_in_row = 0
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -359,14 +403,28 @@ def run(cfg: Config) -> None:
                           **loader_kw, **({} if cfg.smoke else {"prefetch_factor": 4}))
     val_dl = DataLoader(BallClips(frames["valid"], val_s, train=False), batch_size=4, **loader_kw)
 
-    model = BallNet(widths=cfg.widths).to(device).to(memory_format=torch.channels_last)
+    model = BallNet(widths=cfg.widths)
+    if cfg.init:
+        check(Path(cfg.init).is_file(), f"--init weights not found: {cfg.init}")
+        init = torch.load(cfg.init, map_location="cpu")
+        check(tuple(init.get("widths", cfg.widths)) == tuple(cfg.widths), "--init weights have different widths")
+        model.load_state_dict(init["model"])
+        log.info("initialised from %s (epoch %s, val %s)", cfg.init, init.get("epoch"), init.get("val"))
+    model = model.to(device).to(memory_format=torch.channels_last)
     log.info("BallNet widths %s: %.2fM parameters", cfg.widths, sum(p.numel() for p in model.parameters()) / 1e6)
     if n_gpu > 1:
         model = nn.DataParallel(model)   # in-process multi-GPU: no subprocesses that can hang
 
-    with phase("training", cfg.hours * 60 + 20):
-        best = train(cfg, model, train_dl, val_dl, device, dtype, deadline, out)
-    check(best["f1"] >= 0 and (out / "ballnet_best.pt").is_file(), "no checkpoint was saved")
+    stopped = None
+    try:
+        with phase("training", cfg.hours * 60 + 20):
+            train(cfg, model, train_dl, val_dl, device, dtype, deadline, out)
+    except RunError as e:
+        # a failure mid-training must not throw away the epochs already saved: still score the best checkpoint
+        check((out / "ballnet_best.pt").is_file(), f"{e} (and no checkpoint was saved)")
+        log.error("training stopped early: %s -> evaluating the best saved checkpoint anyway", e)
+        stopped = e
+    check((out / "ballnet_best.pt").is_file(), "no checkpoint was saved")
 
     with phase("test evaluation", cfg.eval_reserve_min + 5):
         ckpt = torch.load(out / "ballnet_best.pt", map_location=device)
@@ -388,8 +446,10 @@ def run(cfg: Config) -> None:
             test_det = detector_predictions(cfg.detector, frames["test"], test_s[:len(preds)], stop_at)
             result["yolo_detector"] = {"threshold": det_th, "val": det_val,
                                        "test": score(test_det, [s.ball for s in test_s[:len(test_det)]], det_th)}
+        result["training_stopped_early"] = str(stopped) if stopped else None
         (out / "metrics.json").write_text(json.dumps(result, indent=2))
         log.info("RESULT %s", json.dumps(result, indent=2))
+    check(stopped is None, f"training stopped early ({stopped}); test results above are from the best checkpoint")
 
 
 def main() -> int:
@@ -402,10 +462,12 @@ def main() -> int:
     ap.add_argument("--widths", type=int, nargs=4, default=Config.widths)
     ap.add_argument("--workers", type=int, default=Config.workers)
     ap.add_argument("--detector", default=None)
+    ap.add_argument("--init", default=None, help="start from these BallNet weights")
+    ap.add_argument("--lr", type=float, default=Config.lr)
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     cfg = Config(out=a.out, work=a.work, hours=a.hours, deadline_hours=a.deadline_hours, batch=a.batch,
-                 widths=tuple(a.widths), workers=a.workers, detector=a.detector, smoke=a.smoke)
+                 widths=tuple(a.widths), workers=a.workers, detector=a.detector, init=a.init, lr=a.lr, smoke=a.smoke)
     if cfg.smoke:
         cfg.deadline_hours, cfg.hours, cfg.eval_reserve_min, cfg.min_free_disk_gb = 0.5, 0.05, 2.0, 1.0
     setup_logging(Path(cfg.out))

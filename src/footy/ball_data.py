@@ -131,10 +131,10 @@ def extract_frames(ref: ZipRef, samples: list[Sample], out_root: str | Path, wor
 
 
 class BallClips(Dataset):
-    """(x, heatmap, target) with x = 9 x H x W (frames t-1, t, t+1), heatmap = 1 x H x W, target = (x, y, has_ball).
+    """(x, heatmap, target): x = uint8 9 x H x W (frames t-1, t, t+1), heatmap = 1 x H x W, target = (x, y, has_ball).
 
-    train=True: random crops (usually around the ball), mirroring and brightness/contrast jitter.
-    train=False: full 1280x720 frames, no augmentation.
+    x stays uint8 (4x less data to copy to the GPU); scaling to [0, 1] and brightness jitter happen on the GPU.
+    train=True: random crops (usually around the ball) and mirroring. train=False: full 1280x720 frames.
     """
 
     def __init__(self, frames: Callable[[str, int], np.ndarray], samples: list[Sample], train: bool,
@@ -155,7 +155,7 @@ class BallClips(Dataset):
         h, w = img.shape[:2]
         if xy is not None and not (0 <= xy[0] < w and 0 <= xy[1] < h):
             xy = None
-        x = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32) / 255.0)
+        x = torch.from_numpy(np.ascontiguousarray(img.transpose(2, 0, 1)))
         heat = torch.from_numpy(gaussian_heatmap(h, w, xy))[None]
         target = torch.tensor([xy[0], xy[1], 1.0] if xy is not None else [0.0, 0.0, 0.0])
         return x, heat, target
@@ -172,6 +172,4 @@ class BallClips(Dataset):
         if random.random() < 0.5:                                      # mirror all 3 frames identically
             img = img[:, ::-1]
             xy = None if xy is None else (cw - 1 - xy[0], xy[1])
-        gain, bias = random.uniform(0.8, 1.2), random.uniform(-20, 20)
-        img = np.clip(img.astype(np.float32) * gain + bias, 0, 255)
         return img, xy
