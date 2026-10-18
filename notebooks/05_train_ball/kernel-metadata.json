@@ -1,0 +1,15 @@
+{
+  "id": "hamzadotexe/football-train-ball",
+  "title": "football-train-ball",
+  "code_file": "train_ball.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": ["hamzadotexe/football-train-detector"],
+  "model_sources": []
+}

@@ -16,3 +16,6 @@ sentencepiece
 # Utilities
 tqdm                    # progress bars
 gdown                   # download sample videos / weights from Google Drive
+
+# Development
+pytest                  # unit tests: python -m pytest tests -q
