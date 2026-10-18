@@ -38,14 +38,18 @@ print(subprocess.run(["git", "-C", "/tmp/football", "log", "--oneline", "-1"], c
 
 # %% [markdown]
 # ## Train
-# Budget: 3 h of training inside a 4 h hard deadline (download + frame extraction + final test fit in the rest).
+# Run 2: continue from run 1's epoch-2 weights (val F1 0.625). Budget: 2.5 h of training inside a 3.5 h deadline
+# (download + frame extraction + test evaluation in the rest). If training stops early, the best checkpoint is
+# still scored on test before the error is raised.
 # The log streams below and is also saved to `ballnet/train.log`.
 
 # %%
 detector = (glob.glob("/kaggle/input/**/football_yolo11m_1280.pt", recursive=True) or [None])[0]
-print("detector weights for comparison:", detector)
+init = glob.glob("/kaggle/input/**/ballnet_run1_epoch2.pt", recursive=True)
+assert init, "run-1 weights dataset (hamzadotexe/ballnet-run1-weights) is not attached"
+print("detector weights for comparison:", detector, "| init:", init[0])
 cmd = [sys.executable, "-u", "/tmp/football/scripts/train_ballnet.py", "--out", "/kaggle/working/ballnet",
-       "--work", "/tmp/ballnet", "--hours", "3.0", "--deadline-hours", "4.0"]
+       "--work", "/tmp/ballnet", "--hours", "2.5", "--deadline-hours", "3.5", "--init", init[0]]
 if detector:
     cmd += ["--detector", detector]
 code = subprocess.run(cmd).returncode
