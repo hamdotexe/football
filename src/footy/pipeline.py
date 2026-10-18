@@ -1,10 +1,13 @@
 """Detection -> tracking -> team assignment -> annotated video."""
+from collections import Counter, defaultdict
+
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
+from footy.ball import BallTracker
 from footy.soccernet import CLASS_NAMES
 from footy.teams import TeamClassifier, TrackTeamVotes, goalkeeper_teams, torso_crop
 
@@ -49,6 +52,8 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
     tracker = ByteTrackTracker(frame_rate=info.fps, lost_track_buffer=int(info.fps),
                                track_activation_threshold=0.5, high_conf_det_threshold=0.5)
     votes = TrackTeamVotes()
+    ball_tracker = BallTracker()
+    role_votes = defaultdict(Counter)   # tracker_id -> votes for player / goalkeeper / referee
 
     # colour index: 0/1 = teams, 2 = referee
     palette = sv.ColorPalette.from_hex(TEAM_COLORS + [REFEREE_COLOR])
@@ -63,15 +68,18 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
         for frame in tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames):
             det = detector(frame)
 
-            # ball: keep only the most confident detection; padded so the marker is visible
-            ball = det[(det.class_id == BALL) & (det.confidence >= 0.3)]
+            # ball: keep only a physically plausible detection (see footy/ball.py); padded so the marker is visible
+            ball = ball_tracker.update(det[(det.class_id == BALL) & (det.confidence >= 0.3)])
             if len(ball):
-                ball = ball[[int(np.argmax(ball.confidence))]]
                 ball.xyxy = sv.pad_boxes(ball.xyxy, px=8)
-                ball.tracker_id = np.array([0])
 
             people = tracker.update(det[det.class_id != BALL])
             people = people[people.tracker_id >= 0]   # drop detections not (yet) part of a confirmed track
+            # role = majority vote over the track's history (the detector is right about a goalkeeper ~half the time
+            # per frame, but over a whole track the majority is reliable, and roles stop flickering)
+            for tid, cls in zip(people.tracker_id, people.class_id):
+                role_votes[tid][int(cls)] += 1
+            people.class_id = np.array([role_votes[t].most_common(1)[0][0] for t in people.tracker_id], dtype=int)
 
             players = people[people.class_id == PLAYER]
             # classify only tracks that still need votes, all in one batched call
