@@ -17,6 +17,8 @@ FINAL = ("COMPLETE", "ERROR", "CANCEL", "FAIL")
 env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 wait_for, folder = sys.argv[1], str((ROOT / sys.argv[2]).resolve())
+# Hard cap on the pushed run (Kaggle kills it after this many seconds), so a bug can never burn the whole session.
+MAX_RUN_SECONDS = int(sys.argv[3]) if len(sys.argv) > 3 else 5 * 3600
 
 
 def log(msg):
@@ -34,5 +36,6 @@ while True:
         log(f"unexpected status (will keep waiting): {status}")
     time.sleep(300)
 
-push = subprocess.run([KAGGLE, "kernels", "push", "-p", folder], capture_output=True, text=True, env=env)
+push = subprocess.run([KAGGLE, "kernels", "push", "-p", folder, "-t", str(MAX_RUN_SECONDS)],
+                      capture_output=True, text=True, env=env)
 log("push result: " + (push.stdout + push.stderr).strip())

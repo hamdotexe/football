@@ -91,11 +91,15 @@ from ultralytics import YOLO
 
 args = dict(data="/kaggle/working/football.yaml", imgsz=1280, epochs=50, time=6.0, patience=10,
             project="/kaggle/working/runs", name="yolo11m_1280", exist_ok=True, workers=4, plots=True)
+# Two GPUs (DDP) only if two are present. No automatic retry: a failure must stop the run, never start a second
+# full training run. If training crashes after saving weights, the saved weights are used.
+gpus = torch.cuda.device_count()
 try:
-    YOLO("yolo11m.pt").train(device=[0, 1], batch=16, **args)
+    YOLO("yolo11m.pt").train(device=[0, 1] if gpus > 1 else 0, batch=16 if gpus > 1 else 8, **args)
 except Exception as e:
-    print("DDP failed, falling back to 1 GPU:", repr(e))
-    YOLO("yolo11m.pt").train(device=0, batch=8, **args)
+    if not os.path.exists("/kaggle/working/runs/yolo11m_1280/weights/last.pt"):
+        raise
+    print("training raised after saving weights; continuing with saved weights:", repr(e))
 
 BEST = "/kaggle/working/runs/yolo11m_1280/weights/best.pt"
 print("best weights:", BEST, os.path.exists(BEST))
