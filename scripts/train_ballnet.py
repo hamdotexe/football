@@ -23,8 +23,10 @@ import math
 import os
 import random
 import shutil
+import subprocess
 import sys
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -45,6 +47,13 @@ from footy.ballnet import ARCHS, build_ballnet, decode, focal_loss  # noqa: E402
 log = logging.getLogger("ballnet")
 REPO = "SoccerNet/SN-GSR-2025"
 EXPECTED_CLIPS = {"train": 57, "valid": 58, "test": 49}
+
+
+# GPU setups tried at startup, fastest first: (memory layout, precision). Some cuDNN versions have no kernel for some
+# conv shapes in some setups (a T4 failed with channels_last + fp16), so the run probes them instead of guessing.
+GPU_CONFIGS = (("channels_last", "half"), ("contiguous", "half"), ("contiguous", "float32"))
+FORMATS = {"channels_last": torch.channels_last, "contiguous": torch.contiguous_format}
+MEMORY_FORMAT = torch.channels_last         # set once by run() from the probe result
 
 
 class RunError(RuntimeError):
@@ -199,7 +208,7 @@ def check_first_batch(x: torch.Tensor, heat: torch.Tensor, target: torch.Tensor)
 
 # ---------------------------------------------------------------------------------------------- train / evaluate
 def autocast(device: str, dtype: torch.dtype):
-    return torch.autocast(device_type="cuda", dtype=dtype, enabled=device == "cuda")
+    return torch.autocast(device_type="cuda", dtype=dtype, enabled=device == "cuda" and dtype != torch.float32)
 
 
 def to_input(x: torch.Tensor, device: str, augment: bool) -> torch.Tensor:
@@ -210,7 +219,7 @@ def to_input(x: torch.Tensor, device: str, augment: bool) -> torch.Tensor:
         gain = torch.empty(n, 1, 1, 1, device=device).uniform_(0.8, 1.2)
         bias = torch.empty(n, 1, 1, 1, device=device).uniform_(-0.08, 0.08)
         x = (x * gain + bias).clamp_(0, 1)
-    return x.contiguous(memory_format=torch.channels_last)
+    return x.contiguous(memory_format=MEMORY_FORMAT)
 
 
 def benchmark(loader: DataLoader, model: nn.Module, device: str, dtype: torch.dtype, batches: int = 20) -> None:
@@ -426,7 +435,7 @@ def make_model(cfg: Config) -> nn.Module:
     return model
 
 
-def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype) -> None:
+def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype, measure_speed: bool = True) -> None:
     """One real training step + one full-frame prediction on random data, before the 30-minute data phase.
 
     GPU-specific failures (unsupported kernels, out of memory) can't be caught by CPU tests; here they stop the run
@@ -442,6 +451,16 @@ def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype
         with autocast(device, dtype):
             loss = focal_loss(model(to_input(torch.randint(0, 256, (n, 9, *cfg.crop), dtype=torch.uint8), device, True)), heat)
         loss.backward()
+        rate = None
+        if measure_speed and device == "cuda" and not cfg.smoke:   # a too-slow setup stops now, not after data prep
+            x = to_input(torch.randint(0, 256, (n, 9, *cfg.crop), dtype=torch.uint8), device, True)
+            torch.cuda.synchronize()
+            t = time.time()
+            for _ in range(5):
+                with autocast(device, dtype):
+                    focal_loss(model(x), heat).backward()
+            torch.cuda.synchronize()
+            rate = 5 * n / (time.time() - t)
         model.eval()
         with torch.no_grad(), autocast(device, dtype):
             out = model(to_input(torch.randint(0, 256, (4, 9, 720, 1280), dtype=torch.uint8), device, False))
@@ -449,19 +468,70 @@ def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype
             torch.cuda.synchronize()           # surface asynchronous CUDA errors here, not later
     except Exception as e:                     # CUDA kernel errors, out of memory, shape bugs
         raise RunError(f"GPU preflight (1 training step at {cfg.crop} + 1 prediction at 720x1280) failed: "
-                       f"{type(e).__name__}: {str(e).splitlines()[0]}") from e
+                       f"{type(e).__name__}: {last_line(e)}") from e
     finally:
         model.zero_grad(set_to_none=True)
         model.train()
     net.load_state_dict(saved)
     check(bool(torch.isfinite(loss)), f"GPU preflight: loss is {loss.item()}")
     check(tuple(out.shape) == (4, 1, 720, 1280), f"GPU preflight: prediction shape {tuple(out.shape)}, expected (4, 1, 720, 1280)")
+    # 5 steps is a rough measurement (25% margin); the exact throughput check runs at training step 170
+    check(rate is None or rate >= 0.75 * cfg.min_samples_per_sec,
+          f"GPU preflight: {rate or 0:.0f} samples/s in this setup: too slow to train in the budget")
     peak = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
-    log.info("GPU preflight OK: training step (batch %d at %dx%d) + 720x1280 prediction, peak GPU memory %.1f GB",
-             n, *cfg.crop, peak)
+    log.info("GPU preflight OK: training step (batch %d at %dx%d) + 720x1280 prediction, GPU %s samples/s, peak GPU memory %.1f GB",
+             n, *cfg.crop, f"{rate:.0f}" if rate else "n/a", peak)
+
+
+def last_line(e: BaseException) -> str:
+    """The informative line of an exception (DataParallel puts the real error at the end of a long message)."""
+    lines = [line.strip() for line in str(e).splitlines() if line.strip()]
+    return lines[-1] if lines else type(e).__name__
+
+
+def probe_main(cfg: Config, setup: str) -> int:
+    """Child process: build the model in one GPU setup and run the preflight. Exit code 0 = this setup works."""
+    global MEMORY_FORMAT
+    fmt, precision = setup.split("/")
+    MEMORY_FORMAT = FORMATS[fmt]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    half = torch.bfloat16 if device == "cuda" and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+    try:
+        if setup in os.environ.get("BALLNET_PROBE_FAIL", "").split(","):   # test hook: simulate failing setups
+            raise RuntimeError(f"simulated failure of {setup}")
+        model = build_ballnet(cfg.arch, cfg.widths, pretrained=False).to(device).to(memory_format=MEMORY_FORMAT)
+        if device == "cuda" and torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+        # CUDA_LAUNCH_BLOCKING (exact error locations) makes the GPU slow here, so speed is measured by the parent
+        gpu_preflight(model, cfg, device, half if precision == "half" else torch.float32, measure_speed=False)
+    except BaseException:
+        traceback.print_exc()                                       # full chained traceback for the parent's log
+        return 1
+    print("PROBE OK", flush=True)
+    return 0
+
+
+def choose_gpu_setup(cfg: Config, half: torch.dtype) -> tuple[str, torch.dtype]:
+    """Try each GPU setup in a fresh process (a CUDA error can poison the process that hit it); use the first that works."""
+    for setup in ("/".join(c) for c in GPU_CONFIGS):
+        cmd = [sys.executable, str(Path(__file__).resolve()), "--probe", setup, "--out", cfg.out, "--work", cfg.work,
+               "--arch", cfg.arch, "--batch", str(cfg.batch), "--widths", *map(str, cfg.widths)] + (["--smoke"] if cfg.smoke else [])
+        t = time.time()
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env={**os.environ, "CUDA_LAUNCH_BLOCKING": "1"})
+            ok, detail = r.returncode == 0 and "PROBE OK" in r.stdout, (r.stdout + r.stderr).strip()
+        except subprocess.TimeoutExpired:
+            ok, detail = False, "timed out after 300 s"
+        if ok:
+            log.info("GPU setup %s works (probe %.0f s)", setup, time.time() - t)
+            fmt, precision = setup.split("/")
+            return fmt, half if precision == "half" else torch.float32
+        log.warning("GPU setup %s FAILED:\n%s", setup, "\n".join(detail.splitlines()[-30:]))
+    raise RunError("the model fails in every GPU setup: see the errors above")
 
 
 def run(cfg: Config) -> None:
+    global MEMORY_FORMAT
     out, work = Path(cfg.out), Path(cfg.work)
     deadline = Deadline(cfg.deadline_hours)
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
@@ -469,10 +539,13 @@ def run(cfg: Config) -> None:
     np.random.seed(0)
     torch.manual_seed(0)
 
-    with phase("environment", 4 if cfg.smoke else 3):
+    with phase("environment", 6):
         device, dtype, n_gpu = check_environment(cfg)
+        fmt, dtype = choose_gpu_setup(cfg, dtype)
+        MEMORY_FORMAT = FORMATS[fmt]
+        log.info("using memory layout %s, precision %s", fmt, dtype)
         model = make_model(cfg)        # downloads the ImageNet weights now: a network problem stops the run in seconds
-        model = model.to(device).to(memory_format=torch.channels_last)
+        model = model.to(device).to(memory_format=MEMORY_FORMAT)
         if n_gpu > 1:
             model = nn.DataParallel(model)   # in-process multi-GPU: no subprocesses that can hang
         gpu_preflight(model, cfg, device, dtype)
@@ -561,10 +634,13 @@ def main() -> int:
     ap.add_argument("--arch", default=Config.arch, choices=ARCHS)
     ap.add_argument("--no-train-on-valid", action="store_true", help="train on the train split only")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--probe", default=None, help=argparse.SUPPRESS)   # internal: test one GPU setup, see choose_gpu_setup
     a = ap.parse_args()
     cfg = Config(out=a.out, work=a.work, hours=a.hours, deadline_hours=a.deadline_hours, batch=a.batch,
                  widths=tuple(a.widths), workers=a.workers, detector=a.detector, init=a.init, lr=a.lr, smoke=a.smoke,
                  arch=a.arch, train_on_valid=not a.no_train_on_valid)
+    if a.probe:
+        return probe_main(cfg, a.probe)
     if cfg.smoke:
         cfg.deadline_hours, cfg.hours, cfg.eval_reserve_min, cfg.min_free_disk_gb = 0.5, 0.05, 2.0, 1.0
     setup_logging(Path(cfg.out))
@@ -572,6 +648,8 @@ def main() -> int:
         run(cfg)
     except RunError as e:
         log.error("STOPPED: %s", e)
+        if e.__cause__ is not None:
+            log.error("cause:\n%s", "".join(traceback.format_exception(e.__cause__)).rstrip())
         return 1
     except torch.cuda.OutOfMemoryError as e:
         log.error("STOPPED: CUDA out of memory (try a smaller --batch): %s", e)
