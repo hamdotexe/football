@@ -75,3 +75,15 @@ def test_augmentation_keeps_ball_label_on_the_ball(seed):
     assert x.dtype == torch.uint8
     assert x[3:6, by, bx].max() == 255                   # middle frame is bright exactly at the label
     assert heat[0, by, bx] == 1.0
+
+
+def test_learning_check_cold_and_warm_start():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from train_ballnet import learning_check
+    cold = [3.2] * 20 + [2.0] * 280                     # from scratch: big drop -> fine
+    assert learning_check(cold, warm_start=False)[0]
+    warm = [2.0] * 20 + [1.8] * 280                     # run 2's real numbers: warm start, small drop -> must pass
+    assert not learning_check(warm, warm_start=False)[0]
+    assert learning_check(warm, warm_start=True)[0]
+    blown = [2.0] * 20 + [3.5] * 280                    # warm start that diverges -> stop
+    assert not learning_check(blown, warm_start=True)[0]

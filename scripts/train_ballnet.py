@@ -132,7 +132,9 @@ def check_environment(cfg: Config) -> tuple[str, torch.dtype, int]:
         log.info("GPU %d: %s, %.0f GB", i, name, torch.cuda.get_device_properties(i).total_memory / 1e9)
     free = shutil.disk_usage(cfg.work).free / 1e9
     check(free >= cfg.min_free_disk_gb, f"only {free:.0f} GB free in {cfg.work}, need {cfg.min_free_disk_gb:.0f}")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # bf16 needs Ampere (compute capability 8+): on a T4 (7.5) torch reports it "supported" but emulates it, slowly
+    major, minor = torch.cuda.get_device_capability(0)
+    dtype = torch.bfloat16 if major >= 8 else torch.float16
     log.info("torch %s | %d CPU workers | %.0f GB free disk | autocast %s", torch.__version__, cfg.workers, free, dtype)
     return "cuda", dtype, n_gpu
 
@@ -237,6 +239,15 @@ def predict(model: nn.Module, loader: DataLoader, device: str, dtype: torch.dtyp
     return preds, truths, True
 
 
+def learning_check(losses: list[float], warm_start: bool) -> tuple[bool, str]:
+    """After ~300 steps. From scratch the loss must have dropped by 20%; a warm-started model is already trained,
+    so its loss can't drop that much and must only not have blown up (> +50%)."""
+    first, recent = float(np.mean(losses[:20])), float(np.mean(losses[-50:]))
+    if warm_start:
+        return recent < 1.5 * first, f"warm-started loss rose {first:.2f} -> {recent:.2f} after {len(losses)} steps: diverging"
+    return recent < 0.8 * first, f"loss {first:.2f} -> {recent:.2f} after {len(losses)} steps: not learning"
+
+
 def lr_at(progress: float, step: int, cfg: Config, warmup: int = 200) -> float:
     """Linear warm-up, then cosine decay over the *time* budget (we don't know steps/hour on a new machine)."""
     if step < warmup:
@@ -300,8 +311,8 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
                     check(rate >= cfg.min_samples_per_sec,
                           f"throughput {rate:.0f} samples/s < {cfg.min_samples_per_sec:.0f}: data loading is starving the GPU")
                 if step == 300:
-                    first, recent = np.mean(losses[:20]), np.mean(losses[-50:])
-                    check(recent < 0.8 * first, f"loss {first:.1f} -> {recent:.1f} after 300 steps: not learning")
+                    ok, message = learning_check(losses, warm_start=cfg.init is not None)
+                    check(ok, message)
                 if step % 200 == 0:
                     log.info("step %d | loss %.3f | lr %.1e | %.0f min", step, np.mean(losses[-200:]), lr, (time.time() - start) / 60)
             if cfg.smoke or time.time() - start > budget:
