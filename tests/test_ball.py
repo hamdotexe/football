@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from footy.ball_data import BallClips, Sample  # noqa: E402
 from footy.ball_metrics import best_threshold, score  # noqa: E402
-from footy.ballnet import BallNet, decode, focal_loss, gaussian_heatmap  # noqa: E402
+from footy.ballnet import BallNet, BallNetL, build_ballnet, decode, focal_loss, gaussian_heatmap, load_ballnet  # noqa: E402
 
 
 def test_heatmap_peaks_at_ball_and_is_empty_without_ball():
@@ -87,3 +87,34 @@ def test_learning_check_cold_and_warm_start():
     assert learning_check(warm, warm_start=True)[0]
     blown = [2.0] * 20 + [3.5] * 280                    # warm start that diverges -> stop
     assert not learning_check(blown, warm_start=True)[0]
+
+
+def test_large_model_any_size_and_middle_frame_init():
+    net = BallNetL(pretrained=False).eval()
+    assert 20e6 < sum(p.numel() for p in net.parameters()) < 30e6
+    with torch.no_grad():
+        assert net(torch.zeros(1, 9, 72, 130)).shape == (1, 1, 72, 130)     # not divisible by 32: padded + cropped
+    w = net.stem[0].weight
+    assert w[:, 3:6].abs().sum() > 0 and w[:, :3].abs().sum() == 0 and w[:, 6:].abs().sum() == 0
+
+
+def test_param_groups_cover_every_parameter_once():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from train_ballnet import Config, param_groups
+    cfg = Config(out="x", work="x")
+    for net, n_groups in ((BallNetL(pretrained=False), 2), (BallNet(), 1)):
+        groups = param_groups(net, cfg)
+        ids = [id(p) for g in groups for p in g["params"]]
+        assert len(groups) == n_groups and len(ids) == len(set(ids)) == len(list(net.parameters()))
+    assert {g["lr_scale"] for g in param_groups(BallNetL(pretrained=False), cfg)} == {1.0, cfg.encoder_lr_scale}
+
+
+def test_load_checkpoints_old_and_new(tmp_path):
+    old = BallNet()
+    torch.save({"model": old.state_dict(), "widths": (32, 64, 128, 256)}, tmp_path / "old.pt")   # run-1 format, no arch
+    model, _ = load_ballnet(tmp_path / "old.pt")
+    assert isinstance(model, BallNet)
+    new = build_ballnet("resnet34")
+    torch.save({"model": new.state_dict(), "arch": "resnet34"}, tmp_path / "new.pt")
+    model, _ = load_ballnet(tmp_path / "new.pt")
+    assert isinstance(model, BallNetL)

@@ -21,6 +21,14 @@
 # The confidence threshold is picked on **validation** matches and applied unchanged to the **test** matches (3 matches
 # never used for training). The fine-tuned YOLO detector is scored on the same test frames with the same rule.
 #
+# ## Run 3 → BallNet-L (this version)
+# The first BallNet (1.95M params, trained from scratch) reached test F1 0.68 vs 0.71 for the fine-tuned YOLO.
+# Its train loss kept falling while validation stayed flat: it memorised its 57 training clips instead of learning
+# what a ball looks like in general. Two changes target exactly that:
+# - **Pretrained encoder:** a ResNet-34 trained on 1.2M ImageNet photos (~24.5M params total). Its general visual
+#   features transfer to unseen stadiums/kits far better than features learned from 3 matches.
+# - **~2x more data:** SoccerNet's `valid` split has 58 labelled clips; 6 stay for validation, the other 52 join training.
+#
 # ## Fail-fast run
 # The training script checks every phase (GPU, downloads, labels, extracted frames, first batch, loss, throughput,
 # validation) and **stops with a logged reason** on any failure. It also enforces its own deadline, so it always
@@ -38,20 +46,14 @@ print(subprocess.run(["git", "-C", "/tmp/football", "log", "--oneline", "-1"], c
 
 # %% [markdown]
 # ## Train
-# Run 2: continue from run 1's epoch-2 weights (val F1 0.625). Budget: 2.5 h of training inside a 3.5 h deadline
-# (download + frame extraction + test evaluation in the rest). If training stops early, the best checkpoint is
-# still scored on test before the error is raised.
+# Budget: 2.5 h of training inside a 3.5 h deadline (download + frame extraction + test evaluation in the rest).
+# If training stops early, the best checkpoint is still scored on test before the error is raised.
+# The YOLO detector was already scored on exactly these test frames (run 3: F1 0.709), so it isn't re-run here.
 # The log streams below and is also saved to `ballnet/train.log`.
 
 # %%
-detector = (glob.glob("/kaggle/input/**/football_yolo11m_1280.pt", recursive=True) or [None])[0]
-init = glob.glob("/kaggle/input/**/ballnet_run1_epoch2.pt", recursive=True)
-assert init, "run-1 weights dataset (hamzadotexe/ballnet-run1-weights) is not attached"
-print("detector weights for comparison:", detector, "| init:", init[0])
 cmd = [sys.executable, "-u", "/tmp/football/scripts/train_ballnet.py", "--out", "/kaggle/working/ballnet",
-       "--work", "/tmp/ballnet", "--hours", "2.5", "--deadline-hours", "3.5", "--init", init[0]]
-if detector:
-    cmd += ["--detector", detector]
+       "--work", "/tmp/ballnet", "--arch", "resnet34", "--hours", "2.5", "--deadline-hours", "3.5"]
 code = subprocess.run(cmd).returncode
 if code != 0:
     print(open("/kaggle/working/ballnet/train.log").read()[-3000:])

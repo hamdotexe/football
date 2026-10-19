@@ -39,7 +39,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from footy.ball_data import (BallClips, DirFrames, Sample, ZipRef, extract_frames, list_clips,  # noqa: E402
                              load_samples)
 from footy.ball_metrics import best_threshold, score  # noqa: E402
-from footy.ballnet import BallNet, decode, focal_loss  # noqa: E402
+from footy.ballnet import ARCHS, build_ballnet, decode, focal_loss  # noqa: E402
 
 log = logging.getLogger("ballnet")
 REPO = "SoccerNet/SN-GSR-2025"
@@ -67,8 +67,11 @@ class Config:
     epoch_samples: int = 40_000
     lr: float = 5e-4
     init: str | None = None                 # start from these weights (e.g. a previous run's best)
-    widths: tuple[int, ...] = (32, 64, 128, 256)
-    val_clips: int = 6
+    arch: str = "resnet34"                  # "small" (1.95M, from scratch) or "resnet34" (~24.5M, ImageNet encoder)
+    encoder_lr_scale: float = 0.2           # pretrained encoder learns 5x slower than the new decoder
+    widths: tuple[int, ...] = (32, 64, 128, 256)   # "small" only
+    val_clips: int = 6                      # first 6 valid clips: validation (same clips in every run)
+    train_on_valid: bool = True             # the other 52 labelled valid clips are added to training
     eval_stride: int = 5                    # validate/test on every 5th frame
     workers: int = os.cpu_count() or 4
     detector: str | None = None             # YOLO weights to compare on the same test frames
@@ -151,22 +154,29 @@ def fetch_zip(split: str, cfg: Config) -> ZipRef:
     return ZipRef(path)
 
 
-def split_samples(ref: ZipRef, split: str, cfg: Config, n_clips: int | None, stride: int) -> list[Sample]:
+def split_clips(ref: ZipRef, split: str, cfg: Config) -> list[str]:
     with ref.open() as zf:
         clips = list_clips(zf)
-        if not cfg.smoke:
-            check(len(clips) == EXPECTED_CLIPS[split], f"{split}: {len(clips)} clips, expected {EXPECTED_CLIPS[split]}")
-        samples = load_samples(zf, set(clips[:n_clips]) if n_clips else None)[::stride]
-    check(len(samples) > 0, f"{split}: no samples")
+    if not cfg.smoke:
+        check(len(clips) == EXPECTED_CLIPS[split], f"{split}: {len(clips)} clips, expected {EXPECTED_CLIPS[split]}")
+    return clips
+
+
+def clip_samples(ref: ZipRef, name: str, clips: list[str], stride: int) -> list[Sample]:
+    check(len(clips) > 0, f"{name}: no clips selected")
+    with ref.open() as zf:
+        samples = load_samples(zf, set(clips))[::stride]
+    check(len(samples) > 0, f"{name}: no samples")
     visible = float(np.mean([s.ball is not None for s in samples]))
-    check(0.7 <= visible <= 1.0, f"{split}: ball visible in {visible:.0%} of frames: label parsing looks wrong")
-    log.info("%s: %d samples from %d clips, ball visible in %.0f%%", split, len(samples), n_clips or len(clips), 100 * visible)
+    check(0.7 <= visible <= 1.0, f"{name}: ball visible in {visible:.0%} of frames: label parsing looks wrong")
+    log.info("%s: %d samples from %d clips, ball visible in %.0f%%", name, len(samples), len(clips), 100 * visible)
     return samples
 
 
-def extract_and_verify(ref: ZipRef, samples: list[Sample], root: Path, workers: int) -> DirFrames:
-    written = extract_frames(ref, samples, root, workers)
-    needed = {(s.clip, n) for s in samples for n in (s.frame - 1, s.frame, s.frame + 1)}
+def extract_and_verify(sources: list[tuple[ZipRef, list[Sample]]], root: Path, workers: int) -> DirFrames:
+    """Extract the frames of several (zip, samples) sources into one folder, then verify every needed frame exists."""
+    written = sum(extract_frames(ref, samples, root, workers) for ref, samples in sources if samples)
+    needed = {(s.clip, n) for _, samples in sources for s in samples for n in (s.frame - 1, s.frame, s.frame + 1)}
     missing = [k for k in needed if not (root / k[0] / f"{k[1]:06d}.jpg").is_file()]
     check(not missing, f"{len(missing)} extracted frames missing, e.g. {missing[:3]}")
     frames = DirFrames(root)
@@ -255,13 +265,26 @@ def lr_at(progress: float, step: int, cfg: Config, warmup: int = 200) -> float:
     return 1e-5 + 0.5 * (cfg.lr - 1e-5) * (1 + math.cos(math.pi * min(progress, 1.0)))
 
 
+def param_groups(model: nn.Module, cfg: Config) -> list[dict]:
+    """Pretrained encoder weights get a smaller learning rate than the freshly initialised decoder."""
+    net = model.module if isinstance(model, nn.DataParallel) else model
+    pretrained = list(net.pretrained_parameters()) if hasattr(net, "pretrained_parameters") else []
+    ids = {id(p) for p in pretrained}
+    rest = [p for p in net.parameters() if id(p) not in ids]
+    groups = [{"params": rest, "lr_scale": 1.0}]
+    if pretrained:
+        groups.append({"params": pretrained, "lr_scale": cfg.encoder_lr_scale})
+    check(sum(len(g["params"]) for g in groups) == len(list(net.parameters())), "optimizer does not cover every parameter")
+    return groups
+
+
 def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoader, device: str, dtype: torch.dtype,
           deadline: Deadline, out: Path) -> dict:
     budget = min(cfg.hours * 3600, deadline.remaining() - cfg.eval_reserve_min * 60)
     check(budget > (30 if cfg.smoke else 600), f"only {budget / 60:.0f} min left for training")
     log.info("training budget %.0f min", budget / 60)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(param_groups(model, cfg), lr=cfg.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda" and dtype == torch.float16)   # fp16 needs loss scaling
     if not cfg.smoke:
         benchmark(train_dl, model, device, dtype)
@@ -278,7 +301,7 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
                 check_first_batch(x, heat, target)
             lr = lr_at((time.time() - start) / budget, step, cfg)
             for g in opt.param_groups:
-                g["lr"] = lr
+                g["lr"] = lr * g["lr_scale"]
             x = to_input(x, device, augment=True)
             heat = heat.to(device, non_blocking=True)
             with autocast(device, dtype):
@@ -330,7 +353,7 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
             check(max(r["val_f1"] for r in history) > 0.05, "validation F1 still ~0 after 3 epochs: not learning")
 
         state = (model.module if isinstance(model, nn.DataParallel) else model).state_dict()
-        ckpt = {"model": state, "widths": cfg.widths, "threshold": th, "epoch": epoch, "val": val}
+        ckpt = {"model": state, "arch": cfg.arch, "widths": cfg.widths, "threshold": th, "epoch": epoch, "val": val}
         torch.save(ckpt, out / "ballnet_last.pt")
         if val["f1"] > best["f1"]:
             best = {"f1": val["f1"], "epoch": epoch, "threshold": th, "val": val}
@@ -382,6 +405,26 @@ def save_examples(frames: DirFrames, samples: list[Sample], preds: list, thresho
 
 
 # ----------------------------------------------------------------------------------------------------------- main
+def make_model(cfg: Config) -> nn.Module:
+    check(cfg.arch in ARCHS, f"unknown --arch {cfg.arch!r}, expected one of {ARCHS}")
+    try:
+        model = build_ballnet(cfg.arch, cfg.widths, pretrained=cfg.init is None)
+    except Exception as e:   # torchvision weight download (network, disk) or a missing package
+        raise RunError(f"could not build BallNet {cfg.arch!r}: {type(e).__name__}: {e}") from e
+    if cfg.init:
+        check(Path(cfg.init).is_file(), f"--init weights not found: {cfg.init}")
+        init = torch.load(cfg.init, map_location="cpu")
+        init_arch = init.get("arch", "small")
+        check(init_arch == cfg.arch, f"--init weights are arch {init_arch!r}, this run is {cfg.arch!r}")
+        if cfg.arch == "small":
+            check(tuple(init.get("widths", cfg.widths)) == tuple(cfg.widths), "--init weights have different widths")
+        model.load_state_dict(init["model"])
+        log.info("initialised from %s (epoch %s, val %s)", cfg.init, init.get("epoch"), init.get("val"))
+    log.info("BallNet %s: %.2fM parameters%s", cfg.arch, sum(p.numel() for p in model.parameters()) / 1e6,
+             "" if cfg.init or cfg.arch == "small" else " (ImageNet-pretrained encoder)")
+    return model
+
+
 def run(cfg: Config) -> None:
     out, work = Path(cfg.out), Path(cfg.work)
     deadline = Deadline(cfg.deadline_hours)
@@ -390,19 +433,30 @@ def run(cfg: Config) -> None:
     np.random.seed(0)
     torch.manual_seed(0)
 
-    with phase("environment", 2):
+    with phase("environment", 3):
         device, dtype, n_gpu = check_environment(cfg)
+        model = make_model(cfg)        # downloads the ImageNet weights now: a network problem stops the run in seconds
 
-    with phase("data", 3 if cfg.smoke else 40):
+    with phase("data", 6 if cfg.smoke else 55):
         refs = {split: fetch_zip(split, cfg) for split in ("train", "valid", "test")}
-        n_clips = 1 if cfg.smoke else None
-        train_s = split_samples(refs["train"], "train", cfg, n_clips, stride=1)
-        val_s = split_samples(refs["valid"], "valid", cfg, 1 if cfg.smoke else cfg.val_clips, stride=cfg.eval_stride)
-        test_s = split_samples(refs["test"], "test", cfg, n_clips, stride=cfg.eval_stride)
+        clips = {split: split_clips(refs[split], split, cfg) for split in refs}
+        for a, b in (("train", "valid"), ("train", "test"), ("valid", "test")):
+            check(not set(clips[a]) & set(clips[b]), f"clip names shared by {a} and {b}: frames would mix")
+        n = 1 if cfg.smoke else None
+        val_clips = clips["valid"][:1 if cfg.smoke else cfg.val_clips]
+        extra_clips = clips["valid"][len(val_clips):][:n] if cfg.train_on_valid else []
+        train_s = clip_samples(refs["train"], "train", clips["train"][:n], stride=1)
+        extra_s = clip_samples(refs["valid"], "valid (training part)", extra_clips, stride=1) if extra_clips else []
+        val_s = clip_samples(refs["valid"], "valid", val_clips, stride=cfg.eval_stride)
+        test_s = clip_samples(refs["test"], "test", clips["test"][:n], stride=cfg.eval_stride)
+        check(not {s.clip for s in extra_s} & {s.clip for s in val_s}, "a validation clip is also in training")
         if cfg.smoke:
-            train_s, val_s, test_s = train_s[300:306], val_s[:4], test_s[:4]
-        frames = {name: extract_and_verify(refs[name], s, work / "frames" / name, cfg.workers)
-                  for name, s in (("train", train_s), ("valid", val_s), ("test", test_s))}
+            train_s, extra_s, val_s, test_s = train_s[300:306], extra_s[300:303], val_s[:4], test_s[:4]
+        frames = {"train": extract_and_verify([(refs["train"], train_s), (refs["valid"], extra_s)], work / "frames" / "train", cfg.workers),
+                  "valid": extract_and_verify([(refs["valid"], val_s)], work / "frames" / "valid", cfg.workers),
+                  "test": extract_and_verify([(refs["test"], test_s)], work / "frames" / "test", cfg.workers)}
+        train_s = train_s + extra_s
+        log.info("training on %d samples from %d clips", len(train_s), len({s.clip for s in train_s}))
         if not cfg.smoke:
             shutil.rmtree(work / "zips", ignore_errors=True)   # frames are extracted; free ~30 GB
 
@@ -414,15 +468,7 @@ def run(cfg: Config) -> None:
                           **loader_kw, **({} if cfg.smoke else {"prefetch_factor": 4}))
     val_dl = DataLoader(BallClips(frames["valid"], val_s, train=False), batch_size=4, **loader_kw)
 
-    model = BallNet(widths=cfg.widths)
-    if cfg.init:
-        check(Path(cfg.init).is_file(), f"--init weights not found: {cfg.init}")
-        init = torch.load(cfg.init, map_location="cpu")
-        check(tuple(init.get("widths", cfg.widths)) == tuple(cfg.widths), "--init weights have different widths")
-        model.load_state_dict(init["model"])
-        log.info("initialised from %s (epoch %s, val %s)", cfg.init, init.get("epoch"), init.get("val"))
     model = model.to(device).to(memory_format=torch.channels_last)
-    log.info("BallNet widths %s: %.2fM parameters", cfg.widths, sum(p.numel() for p in model.parameters()) / 1e6)
     if n_gpu > 1:
         model = nn.DataParallel(model)   # in-process multi-GPU: no subprocesses that can hang
 
@@ -475,10 +521,13 @@ def main() -> int:
     ap.add_argument("--detector", default=None)
     ap.add_argument("--init", default=None, help="start from these BallNet weights")
     ap.add_argument("--lr", type=float, default=Config.lr)
+    ap.add_argument("--arch", default=Config.arch, choices=ARCHS)
+    ap.add_argument("--no-train-on-valid", action="store_true", help="train on the train split only")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     cfg = Config(out=a.out, work=a.work, hours=a.hours, deadline_hours=a.deadline_hours, batch=a.batch,
-                 widths=tuple(a.widths), workers=a.workers, detector=a.detector, init=a.init, lr=a.lr, smoke=a.smoke)
+                 widths=tuple(a.widths), workers=a.workers, detector=a.detector, init=a.init, lr=a.lr, smoke=a.smoke,
+                 arch=a.arch, train_on_valid=not a.no_train_on_valid)
     if cfg.smoke:
         cfg.deadline_hours, cfg.hours, cfg.eval_reserve_min, cfg.min_free_disk_gb = 0.5, 0.05, 2.0, 1.0
     setup_logging(Path(cfg.out))

@@ -8,8 +8,8 @@
   "enable_gpu": true,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["hamzadotexe/ballnet-run1-weights"],
+  "dataset_sources": [],
   "competition_sources": [],
-  "kernel_sources": ["hamzadotexe/football-train-detector"],
+  "kernel_sources": [],
   "model_sources": []
 }
