@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import csv
 import json
 import logging
@@ -425,6 +426,41 @@ def make_model(cfg: Config) -> nn.Module:
     return model
 
 
+def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype) -> None:
+    """One real training step + one full-frame prediction on random data, before the 30-minute data phase.
+
+    GPU-specific failures (unsupported kernels, out of memory) can't be caught by CPU tests; here they stop the run
+    within a minute or two of starting. The model's weights and BatchNorm statistics are restored afterwards.
+    """
+    net = model.module if isinstance(model, nn.DataParallel) else model
+    saved = copy.deepcopy(net.state_dict())
+    n = 2 if cfg.smoke else cfg.batch
+    try:
+        model.train()
+        heat = torch.zeros(n, 1, *cfg.crop, device=device)
+        heat[:, 0, cfg.crop[0] // 2, cfg.crop[1] // 2] = 1
+        with autocast(device, dtype):
+            loss = focal_loss(model(to_input(torch.randint(0, 256, (n, 9, *cfg.crop), dtype=torch.uint8), device, True)), heat)
+        loss.backward()
+        model.eval()
+        with torch.no_grad(), autocast(device, dtype):
+            out = model(to_input(torch.randint(0, 256, (4, 9, 720, 1280), dtype=torch.uint8), device, False))
+        if device == "cuda":
+            torch.cuda.synchronize()           # surface asynchronous CUDA errors here, not later
+    except Exception as e:                     # CUDA kernel errors, out of memory, shape bugs
+        raise RunError(f"GPU preflight (1 training step at {cfg.crop} + 1 prediction at 720x1280) failed: "
+                       f"{type(e).__name__}: {str(e).splitlines()[0]}") from e
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.train()
+    net.load_state_dict(saved)
+    check(bool(torch.isfinite(loss)), f"GPU preflight: loss is {loss.item()}")
+    check(tuple(out.shape) == (4, 1, 720, 1280), f"GPU preflight: prediction shape {tuple(out.shape)}, expected (4, 1, 720, 1280)")
+    peak = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
+    log.info("GPU preflight OK: training step (batch %d at %dx%d) + 720x1280 prediction, peak GPU memory %.1f GB",
+             n, *cfg.crop, peak)
+
+
 def run(cfg: Config) -> None:
     out, work = Path(cfg.out), Path(cfg.work)
     deadline = Deadline(cfg.deadline_hours)
@@ -433,9 +469,13 @@ def run(cfg: Config) -> None:
     np.random.seed(0)
     torch.manual_seed(0)
 
-    with phase("environment", 3):
+    with phase("environment", 4 if cfg.smoke else 3):
         device, dtype, n_gpu = check_environment(cfg)
         model = make_model(cfg)        # downloads the ImageNet weights now: a network problem stops the run in seconds
+        model = model.to(device).to(memory_format=torch.channels_last)
+        if n_gpu > 1:
+            model = nn.DataParallel(model)   # in-process multi-GPU: no subprocesses that can hang
+        gpu_preflight(model, cfg, device, dtype)
 
     with phase("data", 6 if cfg.smoke else 55):
         refs = {split: fetch_zip(split, cfg) for split in ("train", "valid", "test")}
@@ -468,9 +508,6 @@ def run(cfg: Config) -> None:
                           **loader_kw, **({} if cfg.smoke else {"prefetch_factor": 4}))
     val_dl = DataLoader(BallClips(frames["valid"], val_s, train=False), batch_size=4, **loader_kw)
 
-    model = model.to(device).to(memory_format=torch.channels_last)
-    if n_gpu > 1:
-        model = nn.DataParallel(model)   # in-process multi-GPU: no subprocesses that can hang
 
     stopped = None
     try:

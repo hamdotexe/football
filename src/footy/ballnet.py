@@ -63,7 +63,10 @@ class BallNetL(nn.Module):
         super().__init__()
         from torchvision.models import ResNet34_Weights, resnet34
         r = resnet34(weights=ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
-        conv1 = nn.Conv2d(3 * in_frames, 64, 7, stride=2, padding=3, bias=False)
+        # fp16 GPU kernels want channel counts in multiples of 8: 9 input channels crashed a T4 ("misaligned
+        # address"), so the input is padded with zero channels to 16. The extra channels are always 0: no effect.
+        self.in_frames, self.in_ch = in_frames, -(-3 * in_frames // 8) * 8
+        conv1 = nn.Conv2d(self.in_ch, 64, 7, stride=2, padding=3, bias=False)
         with torch.no_grad():
             # ImageNet weights expect one RGB image; we feed 3 BGR frames. The middle frame gets the pretrained filters
             # (so at the start the model sees frame t exactly like the ImageNet model would); the neighbouring frames
@@ -75,7 +78,7 @@ class BallNetL(nn.Module):
         self.pool = r.maxpool
         self.layer1, self.layer2, self.layer3, self.layer4 = r.layer1, r.layer2, r.layer3, r.layer4
         # layer1: 1/4 64 ch | layer2: 1/8 128 | layer3: 1/16 256 | layer4: 1/32 512 (r.fc, the classifier, is dropped)
-        self.full = conv_block(3 * in_frames, 16)                           # full-resolution detail branch
+        self.full = conv_block(self.in_ch, 16)                              # full-resolution detail branch
         self.dec4 = conv_block(512 + 256, 256)
         self.dec3 = conv_block(256 + 128, 128)
         self.dec2 = conv_block(128 + 64, 64)
@@ -95,7 +98,8 @@ class BallNetL(nn.Module):
     def forward(self, x):
         h, w = x.shape[-2:]
         x = (x - self.mean) / self.std
-        x = F.pad(x, (0, -w % 32, 0, -h % 32))      # ResNet needs sizes divisible by 32 (720 -> 736); cropped below
+        # zero channels up to in_ch, and ResNet needs sizes divisible by 32 (720 -> 736; cropped off below)
+        x = F.pad(x, (0, -w % 32, 0, -h % 32, 0, self.in_ch - x.shape[1]))
         f0 = self.full(x)
         s1 = self.stem(x)
         s2 = self.layer1(self.pool(s1))
