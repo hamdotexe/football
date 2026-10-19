@@ -88,6 +88,7 @@ class Config:
     min_free_disk_gb: float = 60.0
     min_samples_per_sec: float = 20.0
     max_bad_steps_in_row: int = 5            # non-finite losses tolerated in a row before stopping
+    probe_timeout_s: float = 150.0          # one GPU-setup probe takes ~30 s; longer means it hung
     smoke: bool = False
 
 
@@ -435,7 +436,8 @@ def make_model(cfg: Config) -> nn.Module:
     return model
 
 
-def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype, measure_speed: bool = True) -> None:
+def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype, measure_speed: bool = True,
+                  batch: int | None = None) -> None:
     """One real training step + one full-frame prediction on random data, before the 30-minute data phase.
 
     GPU-specific failures (unsupported kernels, out of memory) can't be caught by CPU tests; here they stop the run
@@ -443,7 +445,7 @@ def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype
     """
     net = model.module if isinstance(model, nn.DataParallel) else model
     saved = copy.deepcopy(net.state_dict())
-    n = 2 if cfg.smoke else cfg.batch
+    n = batch or (2 if cfg.smoke else cfg.batch)
     try:
         model.train()
         heat = torch.zeros(n, 1, *cfg.crop, device=device)
@@ -497,13 +499,16 @@ def probe_main(cfg: Config, setup: str) -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     half = torch.bfloat16 if device == "cuda" and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
     try:
-        if setup in os.environ.get("BALLNET_PROBE_FAIL", "").split(","):   # test hook: simulate failing setups
+        if setup in os.environ.get("BALLNET_PROBE_FAIL", "").split(","):   # test hooks: simulate failing / hanging setups
             raise RuntimeError(f"simulated failure of {setup}")
+        if setup in os.environ.get("BALLNET_PROBE_HANG", "").split(","):
+            time.sleep(10 * cfg.probe_timeout_s)
+        # One GPU, no DataParallel: GPU kernels are the same on every GPU, and multi-GPU syncing is what deadlocked
+        # an earlier version of this probe. The batch is the per-GPU share. DataParallel is then checked by the
+        # parent's own preflight. Speed is measured there too.
         model = build_ballnet(cfg.arch, cfg.widths, pretrained=False).to(device).to(memory_format=MEMORY_FORMAT)
-        if device == "cuda" and torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
-        # CUDA_LAUNCH_BLOCKING (exact error locations) makes the GPU slow here, so speed is measured by the parent
-        gpu_preflight(model, cfg, device, half if precision == "half" else torch.float32, measure_speed=False)
+        per_gpu = max(1, cfg.batch // torch.cuda.device_count()) if device == "cuda" else None
+        gpu_preflight(model, cfg, device, half if precision == "half" else torch.float32, measure_speed=False, batch=per_gpu)
     except BaseException:
         traceback.print_exc()                                       # full chained traceback for the parent's log
         return 1
@@ -518,10 +523,12 @@ def choose_gpu_setup(cfg: Config, half: torch.dtype) -> tuple[str, torch.dtype]:
                "--arch", cfg.arch, "--batch", str(cfg.batch), "--widths", *map(str, cfg.widths)] + (["--smoke"] if cfg.smoke else [])
         t = time.time()
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env={**os.environ, "CUDA_LAUNCH_BLOCKING": "1"})
+            # no CUDA_LAUNCH_BLOCKING: with it, multi-GPU syncing deadlocks (it hung every probe on Kaggle)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=cfg.probe_timeout_s)
             ok, detail = r.returncode == 0 and "PROBE OK" in r.stdout, (r.stdout + r.stderr).strip()
         except subprocess.TimeoutExpired:
-            ok, detail = False, "timed out after 300 s"
+            # a hang is not "this setup is unsupported": the next setups would very likely hang too, so stop now
+            raise RunError(f"GPU setup probe {setup} hung for {cfg.probe_timeout_s:.0f} s: stopping instead of waiting on the others")
         if ok:
             log.info("GPU setup %s works (probe %.0f s)", setup, time.time() - t)
             fmt, precision = setup.split("/")
@@ -643,6 +650,7 @@ def main() -> int:
         return probe_main(cfg, a.probe)
     if cfg.smoke:
         cfg.deadline_hours, cfg.hours, cfg.eval_reserve_min, cfg.min_free_disk_gb = 0.5, 0.05, 2.0, 1.0
+        cfg.probe_timeout_s = 60.0
     setup_logging(Path(cfg.out))
     try:
         run(cfg)
