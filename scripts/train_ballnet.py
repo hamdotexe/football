@@ -49,9 +49,10 @@ REPO = "SoccerNet/SN-GSR-2025"
 EXPECTED_CLIPS = {"train": 57, "valid": 58, "test": 49}
 
 
-# GPU setups tried at startup, fastest first: (memory layout, precision). Some cuDNN versions have no kernel for some
-# conv shapes in some setups (a T4 failed with channels_last + fp16), so the run probes them instead of guessing.
-GPU_CONFIGS = (("channels_last", "half"), ("contiguous", "half"), ("contiguous", "float32"))
+# GPU setups tried at startup, fastest first: memory layout / GPUs ("both" = DataParallel over every GPU). On Kaggle's
+# T4s, BallNet-L crashed ("misaligned address") with channels_last + DataParallel but worked with channels_last on one
+# GPU, so the run probes the exact training setup instead of guessing. Precision is always the GPU's fast half type.
+GPU_CONFIGS = (("channels_last", "both"), ("contiguous", "both"), ("channels_last", "one"), ("contiguous", "one"))
 FORMATS = {"channels_last": torch.channels_last, "contiguous": torch.contiguous_format}
 MEMORY_FORMAT = torch.channels_last         # set once by run() from the probe result
 
@@ -146,9 +147,7 @@ def check_environment(cfg: Config) -> tuple[str, torch.dtype, int]:
         log.info("GPU %d: %s, %.0f GB", i, name, torch.cuda.get_device_properties(i).total_memory / 1e9)
     free = shutil.disk_usage(cfg.work).free / 1e9
     check(free >= cfg.min_free_disk_gb, f"only {free:.0f} GB free in {cfg.work}, need {cfg.min_free_disk_gb:.0f}")
-    # bf16 needs Ampere (compute capability 8+): on a T4 (7.5) torch reports it "supported" but emulates it, slowly
-    major, minor = torch.cuda.get_device_capability(0)
-    dtype = torch.bfloat16 if major >= 8 else torch.float16
+    dtype = half_dtype()
     log.info("torch %s | %d CPU workers | %.0f GB free disk | autocast %s", torch.__version__, cfg.workers, free, dtype)
     return "cuda", dtype, n_gpu
 
@@ -437,7 +436,7 @@ def make_model(cfg: Config) -> nn.Module:
 
 
 def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype, measure_speed: bool = True,
-                  batch: int | None = None) -> None:
+                  batch: int | None = None) -> float | None:
     """One real training step + one full-frame prediction on random data, before the 30-minute data phase.
 
     GPU-specific failures (unsupported kernels, out of memory) can't be caught by CPU tests; here they stop the run
@@ -458,11 +457,11 @@ def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype
             x = to_input(torch.randint(0, 256, (n, 9, *cfg.crop), dtype=torch.uint8), device, True)
             torch.cuda.synchronize()
             t = time.time()
-            for _ in range(5):
+            for _ in range(10):
                 with autocast(device, dtype):
                     focal_loss(model(x), heat).backward()
             torch.cuda.synchronize()
-            rate = 5 * n / (time.time() - t)
+            rate = 10 * n / (time.time() - t)
         model.eval()
         with torch.no_grad(), autocast(device, dtype):
             out = model(to_input(torch.randint(0, 256, (4, 9, 720, 1280), dtype=torch.uint8), device, False))
@@ -477,12 +476,13 @@ def gpu_preflight(model: nn.Module, cfg: Config, device: str, dtype: torch.dtype
     net.load_state_dict(saved)
     check(bool(torch.isfinite(loss)), f"GPU preflight: loss is {loss.item()}")
     check(tuple(out.shape) == (4, 1, 720, 1280), f"GPU preflight: prediction shape {tuple(out.shape)}, expected (4, 1, 720, 1280)")
-    # 5 steps is a rough measurement (25% margin); the exact throughput check runs at training step 170
-    check(rate is None or rate >= 0.75 * cfg.min_samples_per_sec,
+    # same bar as the throughput check at training step 170: a setup below it would be stopped there anyway
+    check(rate is None or rate >= cfg.min_samples_per_sec,
           f"GPU preflight: {rate or 0:.0f} samples/s in this setup: too slow to train in the budget")
     peak = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
     log.info("GPU preflight OK: training step (batch %d at %dx%d) + 720x1280 prediction, GPU %s samples/s, peak GPU memory %.1f GB",
              n, *cfg.crop, f"{rate:.0f}" if rate else "n/a", peak)
+    return rate
 
 
 def last_line(e: BaseException) -> str:
@@ -491,34 +491,39 @@ def last_line(e: BaseException) -> str:
     return lines[-1] if lines else type(e).__name__
 
 
+def half_dtype() -> torch.dtype:
+    """bf16 needs Ampere (compute capability 8+): on a T4 (7.5) torch reports it "supported" but emulates it, slowly."""
+    return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+
+
 def probe_main(cfg: Config, setup: str) -> int:
-    """Child process: build the model in one GPU setup and run the preflight. Exit code 0 = this setup works."""
+    """Child process: the exact training setup (layout, GPUs, batch) does a training step, 10 timed steps and a
+    full-frame prediction. Exit code 0 = this setup works and is fast enough."""
     global MEMORY_FORMAT
-    fmt, precision = setup.split("/")
+    fmt, gpus = setup.split("/")
     MEMORY_FORMAT = FORMATS[fmt]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    half = torch.bfloat16 if device == "cuda" and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
     try:
         if setup in os.environ.get("BALLNET_PROBE_FAIL", "").split(","):   # test hooks: simulate failing / hanging setups
             raise RuntimeError(f"simulated failure of {setup}")
         if setup in os.environ.get("BALLNET_PROBE_HANG", "").split(","):
             time.sleep(10 * cfg.probe_timeout_s)
-        # One GPU, no DataParallel: GPU kernels are the same on every GPU, and multi-GPU syncing is what deadlocked
-        # an earlier version of this probe. The batch is the per-GPU share. DataParallel is then checked by the
-        # parent's own preflight. Speed is measured there too.
         model = build_ballnet(cfg.arch, cfg.widths, pretrained=False).to(device).to(memory_format=MEMORY_FORMAT)
-        per_gpu = max(1, cfg.batch // torch.cuda.device_count()) if device == "cuda" else None
-        gpu_preflight(model, cfg, device, half if precision == "half" else torch.float32, measure_speed=False, batch=per_gpu)
+        if gpus == "both":
+            model = nn.DataParallel(model)
+        rate = gpu_preflight(model, cfg, device, half_dtype(), measure_speed=True)
     except BaseException:
         traceback.print_exc()                                       # full chained traceback for the parent's log
         return 1
-    print("PROBE OK", flush=True)
+    print("PROBE OK", f"GPU {rate:.0f} samples/s" if rate else "speed not measured (CPU)", flush=True)
     return 0
 
 
-def choose_gpu_setup(cfg: Config, half: torch.dtype) -> tuple[str, torch.dtype]:
-    """Try each GPU setup in a fresh process (a CUDA error can poison the process that hit it); use the first that works."""
-    for setup in ("/".join(c) for c in GPU_CONFIGS):
+def choose_gpu_setup(cfg: Config, n_gpu: int) -> tuple[str, bool]:
+    """Try each GPU setup in a fresh process (a CUDA error can poison the process that hit it); use the first that
+    works. Returns (memory layout, use DataParallel)."""
+    setups = [f"{fmt}/{gpus}" for fmt, gpus in GPU_CONFIGS if gpus == "one" or n_gpu > 1]
+    for setup in setups:
         cmd = [sys.executable, str(Path(__file__).resolve()), "--probe", setup, "--out", cfg.out, "--work", cfg.work,
                "--arch", cfg.arch, "--batch", str(cfg.batch), "--widths", *map(str, cfg.widths)] + (["--smoke"] if cfg.smoke else [])
         t = time.time()
@@ -530,9 +535,10 @@ def choose_gpu_setup(cfg: Config, half: torch.dtype) -> tuple[str, torch.dtype]:
             # a hang is not "this setup is unsupported": the next setups would very likely hang too, so stop now
             raise RunError(f"GPU setup probe {setup} hung for {cfg.probe_timeout_s:.0f} s: stopping instead of waiting on the others")
         if ok:
-            log.info("GPU setup %s works (probe %.0f s)", setup, time.time() - t)
-            fmt, precision = setup.split("/")
-            return fmt, half if precision == "half" else torch.float32
+            log.info("GPU setup %s works (probe %.0f s): %s", setup, time.time() - t,
+                     next((line for line in detail.splitlines() if line.startswith("PROBE OK")), ""))
+            fmt, gpus = setup.split("/")
+            return fmt, gpus == "both"
         log.warning("GPU setup %s FAILED:\n%s", setup, "\n".join(detail.splitlines()[-30:]))
     raise RunError("the model fails in every GPU setup: see the errors above")
 
@@ -548,14 +554,14 @@ def run(cfg: Config) -> None:
 
     with phase("environment", 6):
         device, dtype, n_gpu = check_environment(cfg)
-        fmt, dtype = choose_gpu_setup(cfg, dtype)
+        fmt, use_dp = choose_gpu_setup(cfg, n_gpu)
         MEMORY_FORMAT = FORMATS[fmt]
-        log.info("using memory layout %s, precision %s", fmt, dtype)
+        log.info("using memory layout %s, %s, precision %s", fmt, f"DataParallel over {n_gpu} GPUs" if use_dp else "1 GPU", dtype)
         model = make_model(cfg)        # downloads the ImageNet weights now: a network problem stops the run in seconds
         model = model.to(device).to(memory_format=MEMORY_FORMAT)
-        if n_gpu > 1:
+        if use_dp:
             model = nn.DataParallel(model)   # in-process multi-GPU: no subprocesses that can hang
-        gpu_preflight(model, cfg, device, dtype)
+        gpu_preflight(model, cfg, device, dtype, measure_speed=False)   # speed was measured by the probe
 
     with phase("data", 6 if cfg.smoke else 55):
         refs = {split: fetch_zip(split, cfg) for split in ("train", "valid", "test")}
