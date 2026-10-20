@@ -118,3 +118,15 @@ def test_load_checkpoints_old_and_new(tmp_path):
     torch.save({"model": new.state_dict(), "arch": "resnet34"}, tmp_path / "new.pt")
     model, _ = load_ballnet(tmp_path / "new.pt")
     assert isinstance(model, BallNetL)
+
+
+def test_ram_check_stops_before_the_os_kills_the_run(monkeypatch):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import train_ballnet as t
+    monkeypatch.setattr(t, "ram_gb", lambda: (0.8, 20.0))      # 0.8 GB free: below the 1.5 GB floor
+    with pytest.raises(t.RunError, match="RAM nearly exhausted"):
+        t.check_ram("prediction")
+    monkeypatch.setattr(t, "ram_gb", lambda: (12.0, 4.0))
+    t.check_ram("prediction")                                   # plenty free: no error
+    monkeypatch.setattr(t, "ram_gb", lambda: None)              # no /proc (Windows): no error
+    t.check_ram("prediction")

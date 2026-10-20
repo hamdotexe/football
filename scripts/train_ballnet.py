@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import copy
 import csv
+import gc
 import json
 import logging
 import math
@@ -55,6 +56,7 @@ EXPECTED_CLIPS = {"train": 57, "valid": 58, "test": 49}
 GPU_CONFIGS = (("channels_last", "both"), ("contiguous", "both"), ("channels_last", "one"), ("contiguous", "one"))
 FORMATS = {"channels_last": torch.channels_last, "contiguous": torch.contiguous_format}
 MEMORY_FORMAT = torch.channels_last         # set once by run() from the probe result
+MIN_FREE_RAM_GB = 1.5                       # below this the OS kills the run without a word (exit -9): stop first
 
 
 class RunError(RuntimeError):
@@ -90,6 +92,7 @@ class Config:
     min_samples_per_sec: float = 20.0
     max_bad_steps_in_row: int = 5            # non-finite losses tolerated in a row before stopping
     probe_timeout_s: float = 150.0          # one GPU-setup probe takes ~30 s; longer means it hung
+    eval_only: str | None = None            # score this checkpoint on the test split, no training
     smoke: bool = False
 
 
@@ -114,6 +117,29 @@ def phase(name: str, max_minutes: float):
     minutes = (time.time() - t) / 60
     log.info("=== %s done in %.1f min", name, minutes)
     check(minutes <= max_minutes, f"{name} took {minutes:.1f} min (budget {max_minutes:.0f}): too slow, stopping")
+
+
+def ram_gb() -> tuple[float, float] | None:
+    """(available system RAM, this process's resident RAM) in GB, or None where /proc doesn't exist (Windows)."""
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        status = Path("/proc/self/status").read_text()
+    except OSError:
+        return None
+    available = int(next(line.split()[1] for line in meminfo.splitlines() if line.startswith("MemAvailable:")))
+    rss = int(next(line.split()[1] for line in status.splitlines() if line.startswith("VmRSS:")))
+    return available / 1e6, rss / 1e6
+
+
+def ram_text() -> str:
+    ram = ram_gb()
+    return f"RAM {ram[0]:.1f} GB free, main process {ram[1]:.1f} GB" if ram else "RAM n/a"
+
+
+def check_ram(where: str) -> None:
+    ram = ram_gb()
+    check(ram is None or ram[0] >= MIN_FREE_RAM_GB, f"RAM nearly exhausted during {where} ({ram_text()}): stopping "
+          f"before the OS kills the run without a trace")
 
 
 # ---------------------------------------------------------------------------------------------------------- setup
@@ -247,7 +273,9 @@ def predict(model: nn.Module, loader: DataLoader, device: str, dtype: torch.dtyp
     """Peak (x, y, confidence) per frame. Stops early (returns complete=False) if the wall clock passes `stop_at`."""
     model.eval()
     preds, truths = [], []
-    for x, _, target in loader:
+    for i, (x, _, target) in enumerate(loader):
+        if i % 50 == 0:
+            check_ram("prediction")
         with autocast(device, dtype):
             logits = model(to_input(x, device, augment=False))
         preds += decode(logits, threshold=0.0)
@@ -347,7 +375,9 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
                     ok, message = learning_check(losses, warm_start=cfg.init is not None)
                     check(ok, message)
                 if step % 200 == 0:
-                    log.info("step %d | loss %.3f | lr %.1e | %.0f min", step, np.mean(losses[-200:]), lr, (time.time() - start) / 60)
+                    log.info("step %d | loss %.3f | lr %.1e | %.0f min | %s", step, np.mean(losses[-200:]), lr,
+                             (time.time() - start) / 60, ram_text())
+                    check_ram("training")
             if cfg.smoke or time.time() - start > budget:
                 break
 
@@ -357,7 +387,7 @@ def train(cfg: Config, model: nn.Module, train_dl: DataLoader, val_dl: DataLoade
                "train_loss": round(float(np.mean(epoch_losses)), 4), "lr": lr, "val_threshold": th,
                **{f"val_{k}": v for k, v in val.items()}}
         history.append(row)
-        log.info("epoch %d | %s", epoch, json.dumps(row))
+        log.info("epoch %d | %s | %s", epoch, json.dumps(row), ram_text())
         check(not math.isnan(val["f1"]), "validation F1 is NaN")
         if not cfg.smoke and epoch >= 3:
             check(max(r["val_f1"] for r in history) > 0.05, "validation F1 still ~0 after 3 epochs: not learning")
@@ -543,6 +573,57 @@ def choose_gpu_setup(cfg: Config, n_gpu: int) -> tuple[str, bool]:
     raise RunError("the model fails in every GPU setup: see the errors above")
 
 
+def evaluate_test(model: nn.Module, ckpt: dict, frames: DirFrames, test_s: list[Sample], cfg: Config, device: str,
+                  dtype: torch.dtype, deadline: Deadline, out: Path) -> tuple[dict, list]:
+    """Score a checkpoint on the test frames with its validation-chosen threshold; writes examples.jpg."""
+    (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(ckpt["model"])
+    log.info("test evaluation of epoch %s (threshold %s) | %s", ckpt.get("epoch"), ckpt["threshold"], ram_text())
+    # few, non-persistent workers: full-frame batches are large, and running out of RAM here killed run 8
+    test_dl = DataLoader(BallClips(frames, test_s, train=False), batch_size=4, num_workers=0 if cfg.smoke else 2)
+    preds, truths, complete = predict(model, test_dl, device, dtype, stop_at=deadline.end - 300)
+    result = {"ballnet": {"arch": ckpt.get("arch", "small"), "best_epoch": ckpt.get("epoch"),
+                          "threshold": ckpt["threshold"], "val": ckpt.get("val"),
+                          "test": score(preds, truths, ckpt["threshold"])},
+              "test_complete": complete, "test_frames_scored": len(preds), "hit_radius_px_at_1280": 5.0,
+              "minutes_total": round(deadline.elapsed_min(), 1)}
+    if not complete:
+        log.warning("deadline reached: test scored on %d of %d frames only", len(preds), len(test_s))
+    save_examples(frames, test_s, preds, ckpt["threshold"], out / "examples.jpg")
+    return result, preds
+
+
+def run_eval_only(cfg: Config) -> None:
+    """Score an existing checkpoint on the test split (no training data needed)."""
+    global MEMORY_FORMAT
+    out, work = Path(cfg.out), Path(cfg.work)
+    deadline = Deadline(cfg.deadline_hours)
+    with phase("environment", 6):
+        device, dtype, n_gpu = check_environment(cfg)
+        check(Path(cfg.eval_only).is_file(), f"--eval-only checkpoint not found: {cfg.eval_only}")
+        ckpt = torch.load(cfg.eval_only, map_location="cpu")
+        check({"model", "threshold"} <= set(ckpt), f"{cfg.eval_only} is not a BallNet training checkpoint")
+        cfg.arch, cfg.widths = ckpt.get("arch", "small"), tuple(ckpt.get("widths", cfg.widths))
+        log.info("checkpoint %s: arch %s, epoch %s, threshold %s, val %s", cfg.eval_only, cfg.arch, ckpt.get("epoch"),
+                 ckpt["threshold"], ckpt.get("val"))
+        fmt, use_dp = choose_gpu_setup(cfg, n_gpu)
+        MEMORY_FORMAT = FORMATS[fmt]
+        model = build_ballnet(cfg.arch, cfg.widths).to(device).to(memory_format=MEMORY_FORMAT)
+        if use_dp:
+            model = nn.DataParallel(model)
+        gpu_preflight(model, cfg, device, dtype, measure_speed=False)
+    with phase("data", 6 if cfg.smoke else 20):
+        ref = fetch_zip("test", cfg)
+        clips = split_clips(ref, "test", cfg)
+        test_s = clip_samples(ref, "test", clips[:1] if cfg.smoke else clips, stride=cfg.eval_stride)
+        if cfg.smoke:
+            test_s = test_s[:4]
+        frames = extract_and_verify([(ref, test_s)], work / "frames" / "test", cfg.workers)
+    with phase("test evaluation", 30):
+        result, _ = evaluate_test(model, ckpt, frames, test_s, cfg, device, dtype, deadline, out)
+        (out / "metrics.json").write_text(json.dumps(result, indent=2))
+        log.info("RESULT %s", json.dumps(result, indent=2))
+
+
 def run(cfg: Config) -> None:
     global MEMORY_FORMAT
     out, work = Path(cfg.out), Path(cfg.work)
@@ -606,19 +687,15 @@ def run(cfg: Config) -> None:
         stopped = e
     check((out / "ballnet_best.pt").is_file(), "no checkpoint was saved")
 
+    # shut down the training/validation loaders' persistent worker processes before testing: with them still alive,
+    # 4 more test workers ran the machine out of RAM in run 8 (killed with exit code -9)
+    del train_dl, val_dl
+    gc.collect()
+
     with phase("test evaluation", cfg.eval_reserve_min + 5):
-        ckpt = torch.load(out / "ballnet_best.pt", map_location=device)
-        (model.module if isinstance(model, nn.DataParallel) else model).load_state_dict(ckpt["model"])
-        test_dl = DataLoader(BallClips(frames["test"], test_s, train=False), batch_size=4, **loader_kw)
+        ckpt = torch.load(out / "ballnet_best.pt", map_location="cpu")
+        result, preds = evaluate_test(model, ckpt, frames["test"], test_s, cfg, device, dtype, deadline, out)
         stop_at = deadline.end - 300
-        preds, truths, complete = predict(model, test_dl, device, dtype, stop_at=stop_at)
-        result = {"ballnet": {"best_epoch": ckpt["epoch"], "threshold": ckpt["threshold"], "val": ckpt["val"],
-                              "test": score(preds, truths, ckpt["threshold"])},
-                  "test_complete": complete, "test_frames_scored": len(preds), "hit_radius_px_at_1280": 5.0,
-                  "minutes_total": round(deadline.elapsed_min(), 1)}
-        if not complete:
-            log.warning("deadline reached: test scored on %d of %d frames only", len(preds), len(test_s))
-        save_examples(frames["test"], test_s, preds, ckpt["threshold"], out / "examples.jpg")
 
         if cfg.detector and time.time() < stop_at:
             val_det = detector_predictions(cfg.detector, frames["valid"], val_s, stop_at)
@@ -646,12 +723,13 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=Config.lr)
     ap.add_argument("--arch", default=Config.arch, choices=ARCHS)
     ap.add_argument("--no-train-on-valid", action="store_true", help="train on the train split only")
+    ap.add_argument("--eval-only", default=None, metavar="CHECKPOINT", help="score this checkpoint on the test split")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--probe", default=None, help=argparse.SUPPRESS)   # internal: test one GPU setup, see choose_gpu_setup
     a = ap.parse_args()
     cfg = Config(out=a.out, work=a.work, hours=a.hours, deadline_hours=a.deadline_hours, batch=a.batch,
                  widths=tuple(a.widths), workers=a.workers, detector=a.detector, init=a.init, lr=a.lr, smoke=a.smoke,
-                 arch=a.arch, train_on_valid=not a.no_train_on_valid)
+                 arch=a.arch, train_on_valid=not a.no_train_on_valid, eval_only=a.eval_only)
     if a.probe:
         return probe_main(cfg, a.probe)
     if cfg.smoke:
@@ -659,7 +737,7 @@ def main() -> int:
         cfg.probe_timeout_s = 60.0
     setup_logging(Path(cfg.out))
     try:
-        run(cfg)
+        run_eval_only(cfg) if cfg.eval_only else run(cfg)
     except RunError as e:
         log.error("STOPPED: %s", e)
         if e.__cause__ is not None:
