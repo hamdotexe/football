@@ -64,7 +64,7 @@ on validation and applied unchanged to the test split (7,331 frames from 49 clip
   validation stayed flat, and it lost to YOLO on test.
 - **BallNet-L** fixes the two causes: an ImageNet-pretrained encoder (general visual features that transfer to
   unseen stadiums) and ~2× the data (52 labelled clips of SoccerNet's `valid` split that were unused; 6 are kept for
-  validation). It finds 236 more balls than YOLO on the test frames (+3.5 recall points) at almost the same precision,
+  validation). It finds 240 more balls than YOLO on the test frames (+3.5 recall points) at almost the same precision,
   and catches motion-blurred balls during fast camera pans.
 - Fair-comparison caveat: BallNet-L trained on 109 clips, the YOLO detector on 57 (+ Roboflow), so part of the gain
   is data, not architecture.
