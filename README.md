@@ -48,21 +48,29 @@ Known limitations:
   set contains only 3 matches' worth of keeper kits. The pipeline also uses position and tracking to label them.
 - Training data covers only 3 matches, so validation mAP plateaus early: more match diversity would help more than more epochs.
 
-### BallNet: 3-frame ball heatmap model (TrackNet-style U-Net, 1.95M params)
+### BallNet: 3-frame ball heatmap models (TrackNet-style U-Nets)
 
 Input: 3 consecutive frames stacked (9 channels); output: a per-pixel "ball centre" heatmap trained with focal loss.
 A prediction is correct if it lands within **5 px** of the true centre at 1280×720. The confidence threshold is chosen
 on validation and applied unchanged to the test split (7,331 frames from 49 clips never used for training).
 
-| Test split (7,331 frames) | precision | recall | F1 | median error |
-|---|---|---|---|---|
-| Fine-tuned YOLO11m (single frame, 20M params) | **0.799** | 0.637 | **0.709** | 1.12 px |
-| BallNet (3 frames, 1.95M params) | 0.710 | **0.651** | 0.679 | 1.16 px |
+| Test split (7,331 frames) | params | precision | recall | F1 | median error |
+|---|---|---|---|---|---|
+| Fine-tuned YOLO11m (single frame) | 20M | **0.799** | 0.637 | 0.709 | 1.12 px |
+| BallNet (from scratch) | 1.95M | 0.710 | 0.651 | 0.679 | 1.16 px |
+| **BallNet-L** (ImageNet-pretrained ResNet-34 encoder) | 24.5M | 0.789 | **0.672** | **0.726** | 1.17 px |
 
-On validation BallNet scored higher (F1 0.80 vs 0.76), but validation is only 6 clips and was also used to pick the
-best epoch and threshold, so its score is optimistic; the 49-clip test split is the number to trust. BallNet finds
-slightly more balls (recall) but makes more false detections. Training: ~3.4 h total on 2× Tesla T4 (run 1 + a
-warm-started run 2), fp16.
+- **BallNet** (small, trained from scratch on 57 clips) memorised its training clips: train loss kept falling while
+  validation stayed flat, and it lost to YOLO on test.
+- **BallNet-L** fixes the two causes: an ImageNet-pretrained encoder (general visual features that transfer to
+  unseen stadiums) and ~2× the data (52 labelled clips of SoccerNet's `valid` split that were unused; 6 are kept for
+  validation). It finds 236 more balls than YOLO on the test frames (+3.5 recall points) at almost the same precision,
+  and catches motion-blurred balls during fast camera pans.
+- Fair-comparison caveat: BallNet-L trained on 109 clips, the YOLO detector on 57 (+ Roboflow), so part of the gain
+  is data, not architecture.
+- Validation scores are optimistic (6 clips, also used to pick the epoch and threshold): BallNet-L 0.83 val → 0.73 test.
+- Training: 2.5 h on 2× Tesla T4 (fp16, DataParallel). On T4s, cuDNN crashed with channels-last memory layout under
+  DataParallel, so the script probes GPU setups at startup and fell back to the standard layout (59 samples/s).
 
 ## Project layout
 
