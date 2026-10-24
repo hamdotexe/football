@@ -24,6 +24,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -61,6 +62,9 @@ class Config:
     preflight_fraction: float = 0.05
     min_epochs: int = 4              # stop after the preflight if fewer epochs fit in the budget
     max_gpu_mem_frac: float = 0.75   # stop after the preflight if training peaks above this share of GPU memory
+    min_free_ram_gb: float = 2.0     # watchdog: stop training on purpose below this (before the machine is killed)
+    max_output_gb: float = 15.0      # watchdog: Kaggle keeps at most 20 GB of outputs
+    watch_every_s: float = 120.0
     device: str = "0"
     smoke: bool = False
 
@@ -134,23 +138,103 @@ def scan_training_output(text: str) -> dict:
             "batches_per_s": float(statistics.median(rates)) if rates else None}
 
 
+# ------------------------------------------------------------------------------------------------- watchdog
+def system_ram_gb() -> tuple[float, float] | None:
+    """(available, total) system RAM in GB, or None where /proc doesn't exist (Windows)."""
+    try:
+        info = {line.split(":")[0]: int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()}
+    except OSError:
+        return None
+    return info["MemAvailable"] / 1e6, info["MemTotal"] / 1e6
+
+
+def tree_rss_gb(pid: int) -> float | None:
+    """Resident memory of a process plus all its descendants (Ultralytics' data-loader workers), from /proc."""
+    try:
+        children, rss = {}, {}
+        for d in Path("/proc").iterdir():
+            if d.name.isdigit():
+                try:
+                    stat = (d / "stat").read_text()
+                    ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                    rss[int(d.name)] = int(stat.rsplit(")", 1)[1].split()[21]) * os.sysconf("SC_PAGE_SIZE")
+                    children.setdefault(ppid, []).append(int(d.name))
+                except (OSError, ValueError, IndexError):
+                    continue
+    except (OSError, AttributeError):
+        return None
+    todo, total = [pid], 0
+    while todo:
+        p = todo.pop()
+        total += rss.get(p, 0)
+        todo += children.get(p, [])
+    return total / 1e9
+
+
+def dir_size_gb(path: Path) -> float:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file() and not f.is_symlink()) / 1e9
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    if os.name != "nt":
+        os.killpg(proc.pid, signal.SIGKILL)
+    else:
+        proc.kill()
+
+
+class Watchdog(threading.Thread):
+    """Every few minutes: log RAM (system + training processes), output size and epochs done. If free RAM or the
+    output quota runs low, kill training on purpose: a controlled stop keeps the logs and the epochs saved so far,
+    while Kaggle killing the whole machine (pitch runs 1 and 3) loses every output."""
+
+    def __init__(self, proc: subprocess.Popen, cfg: "Config", results_csv: Path):
+        super().__init__(daemon=True)
+        self.proc, self.cfg, self.results_csv = proc, cfg, results_csv
+        self.done, self.reason = threading.Event(), None
+
+    def run(self) -> None:
+        while not self.done.wait(self.cfg.watch_every_s):
+            self.check_once()
+
+    def check_once(self) -> None:
+        ram, rss = system_ram_gb(), tree_rss_gb(self.proc.pid)
+        out_gb = dir_size_gb(Path(self.cfg.out))
+        epochs = len(read_results(self.results_csv)) if self.results_csv.exists() else 0
+        log.info("watchdog | RAM free %s | training processes %s | outputs %.2f GB | epochs done %d",
+                 f"{ram[0]:.1f} of {ram[1]:.1f} GB" if ram else "n/a", f"{rss:.1f} GB" if rss is not None else "n/a",
+                 out_gb, epochs)
+        if ram and ram[0] < self.cfg.min_free_ram_gb:
+            self.reason = f"free RAM down to {ram[0]:.1f} GB (training processes {rss or 0:.1f} GB)"
+        elif out_gb > self.cfg.max_output_gb:
+            self.reason = f"outputs grew to {out_gb:.1f} GB (Kaggle keeps at most 20 GB)"
+        if self.reason and self.proc.poll() is None:
+            log.error("watchdog: %s -> stopping training now, keeping the logs and saved epochs", self.reason)
+            kill_tree(self.proc)
+
+
 # ------------------------------------------------------------------------------------------------- child process
-def run_child(args: dict, log_path: Path, timeout_s: float) -> tuple[int | None, float]:
-    """Run Ultralytics train/val in a separate process with a hard timeout. A hang is killed (with its data-loader
-    workers), never waited on. Returns (exit code or None on timeout, seconds)."""
+def run_child(args: dict, log_path: Path, timeout_s: float, cfg: "Config | None" = None,
+              results_csv: Path | None = None) -> tuple[int | None, float, str | None]:
+    """Run Ultralytics train/val in a separate process with a hard timeout (a hang is killed with its data-loader
+    workers, never waited on). With cfg + results_csv a Watchdog guards RAM and output size meanwhile.
+    Returns (exit code or None on timeout, seconds, watchdog stop reason or None)."""
     cmd = [sys.executable, str(Path(__file__).resolve()), "--child", json.dumps(args)]
     t = time.time()
     with open(log_path, "w") as out:
         proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+        dog = Watchdog(proc, cfg, results_csv) if cfg is not None else None
+        if dog:
+            dog.start()
         try:
-            return proc.wait(timeout=timeout_s), time.time() - t
+            code = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            if os.name != "nt":
-                os.killpg(proc.pid, signal.SIGKILL)
-            else:
-                proc.kill()
+            kill_tree(proc)
             proc.wait()
-            return None, time.time() - t
+            code = None
+        if dog:
+            dog.done.set()
+            dog.join()
+        return code, time.time() - t, dog.reason if dog else None
 
 
 def child_main(args: dict) -> int:
@@ -181,7 +265,8 @@ def tail(path: Path, n: int = 25) -> str:
 
 # ------------------------------------------------------------------------------------------------- phases
 def phase(name: str):
-    log.info("=== %s", name)
+    ram = system_ram_gb()
+    log.info("=== %s | RAM free %s", name, f"{ram[0]:.1f} of {ram[1]:.1f} GB" if ram else "n/a")
     return time.time()
 
 
@@ -265,7 +350,7 @@ def preflight(cfg: Config, pre_yaml: Path, train_images: int, deadline: Deadline
     project = Path(cfg.work) / "preflight"
     args = train_args(cfg, pre_yaml, project, "run") | dict(epochs=1, fraction=cfg.preflight_fraction)
     out_txt = Path(cfg.out) / "preflight_output.txt"
-    code, seconds = run_child(args, out_txt, timeout_s=min(20 * 60, deadline.remaining()))
+    code, seconds, _ = run_child(args, out_txt, timeout_s=min(20 * 60, deadline.remaining()))
     check(code is not None, f"preflight hung for {seconds / 60:.0f} min: stopping\n{tail(out_txt)}")
     check(code == 0, f"preflight failed (exit {code}):\n{tail(out_txt)}")
     seen = scan_training_output(out_txt.read_text(errors="replace"))
@@ -300,11 +385,13 @@ def train(cfg: Config, yaml: Path, deadline: Deadline) -> tuple[Path, dict]:
     log.info("training: %s, %d px, batch %d, %.1f h budget (hard kill after %.0f min)", cfg.model, cfg.imgsz, cfg.batch,
              cfg.hours, budget / 60)
     out_txt = Path(cfg.out) / "training_output.txt"
-    code, seconds = run_child(args, out_txt, timeout_s=budget)
+    code, seconds, stopped_by = run_child(args, out_txt, timeout_s=budget, cfg=cfg,
+                                          results_csv=project / "pitch" / "results.csv")
     weights = project / "pitch" / "weights"
     best = weights / "best.pt" if (weights / "best.pt").exists() else weights / "last.pt"
     if code != 0:
-        reason = "hung and was killed" if code is None else f"exited with code {code}"
+        reason = (f"was stopped by the watchdog ({stopped_by})" if stopped_by else
+                  "hung and was killed" if code is None else f"exited with code {code}")
         check(best.exists(), f"training {reason} and saved no weights:\n{tail(out_txt)}")
         log.error("training %s after %.0f min; scoring the saved weights %s (no retraining)\n%s", reason, seconds / 60,
                   best.name, tail(out_txt))
@@ -318,7 +405,7 @@ def train(cfg: Config, yaml: Path, deadline: Deadline) -> tuple[Path, dict]:
     summary = {"epochs": len(rows), "minutes": round(seconds / 60, 1), "best_epoch": int(best_row["epoch"]),
                "val_pose_mAP50": round(best_row.get(key, 0), 4),
                "val_pose_mAP50-95": round(best_row.get("metrics/mAP50-95(P)", 0), 4),
-               "completed_normally": code == 0}
+               "completed_normally": code == 0, "stopped_by_watchdog": stopped_by}
     for r in rows:
         log.info("epoch %d | pose loss %.3f | val pose mAP50 %.3f mAP50-95 %.3f", r["epoch"], r.get("train/pose_loss", float("nan")),
                  r.get(key, float("nan")), r.get("metrics/mAP50-95(P)", float("nan")))
@@ -347,7 +434,7 @@ def score_test(cfg: Config, best: Path, yaml: Path, deadline: Deadline) -> dict:
     pose_json = out / "test_pose_metrics.json"
     args = dict(mode="val", model=str(best), data=str(yaml), split="test", imgsz=cfg.imgsz, batch=cfg.batch,
                 device=cfg.device, project=str(out / "runs"), name="test", exist_ok=True, plots=False, out_json=str(pose_json))
-    code, _ = run_child(args, out / "test_val_output.txt", timeout_s=min(20 * 60, deadline.remaining()))
+    code, _, _ = run_child(args, out / "test_val_output.txt", timeout_s=min(20 * 60, deadline.remaining()))
     if code == 0 and pose_json.exists():
         result["test_pose"] = json.loads(pose_json.read_text())
     else:   # secondary metric: report, don't fail the run over it
@@ -397,6 +484,7 @@ def main() -> int:
                  imgsz=a.imgsz, batch=a.batch, hours=a.hours, deadline_hours=a.deadline_hours, smoke=a.smoke)
     if cfg.smoke:
         cfg.device, cfg.workers, cfg.preflight_fraction, cfg.test_stride, cfg.val_stride = "cpu", 0, 0.5, 1, 1
+        cfg.watch_every_s = 10.0
     Path(cfg.out).mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
     for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(Path(cfg.out) / "train.log")):

@@ -81,5 +81,24 @@ def test_read_results_tolerates_padding_and_blank_cells(tmp_path):
 
 def test_hung_child_is_killed_at_the_timeout(tmp_path):
     t = time.time()
-    code, seconds = tp.run_child({"mode": "sleep", "seconds": 60}, tmp_path / "out.txt", timeout_s=3)
-    assert code is None and time.time() - t < 20
+    code, seconds, reason = tp.run_child({"mode": "sleep", "seconds": 60}, tmp_path / "out.txt", timeout_s=3)
+    assert code is None and reason is None and time.time() - t < 20
+
+
+def smoke_cfg(tmp_path):
+    return tp.Config(images_root="x", labels_root="x", out=str(tmp_path), work=str(tmp_path), watch_every_s=0.5)
+
+
+def test_watchdog_stops_training_when_ram_runs_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(tp, "system_ram_gb", lambda: (1.2, 30.0))       # 1.2 GB free: below the 2 GB floor
+    t = time.time()
+    code, seconds, reason = tp.run_child({"mode": "sleep", "seconds": 60}, tmp_path / "out.txt", timeout_s=30,
+                                         cfg=smoke_cfg(tmp_path), results_csv=tmp_path / "results.csv")
+    assert code not in (0, None) and "RAM" in reason and time.time() - t < 15
+
+
+def test_watchdog_leaves_healthy_training_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr(tp, "system_ram_gb", lambda: (20.0, 30.0))
+    code, seconds, reason = tp.run_child({"mode": "sleep", "seconds": 2}, tmp_path / "out.txt", timeout_s=30,
+                                         cfg=smoke_cfg(tmp_path), results_csv=tmp_path / "results.csv")
+    assert code == 0 and reason is None

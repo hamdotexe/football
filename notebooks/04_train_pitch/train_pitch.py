@@ -34,6 +34,12 @@
 # The script checks every phase (inputs, label format, flip_idx), runs a **preflight** (the exact training command on
 # 5% of the data for 1 epoch: catches data/config/memory errors in minutes and measures speed), trains in a child
 # process with a hard timeout, and never retrains after a failure: if weights were saved, they are scored.
+#
+# ## Sessions of 1.25 h
+# Two earlier attempts died with **no logs and no outputs at all**: Kaggle killed the whole machine, most likely
+# because RAM ran out during a long session. So training now runs in **sessions of 1.25 h**: each one saves its
+# weights and logs, and the next continues from them. A **watchdog** logs RAM every 2 minutes and, if free RAM drops
+# below 2 GB, stops training on purpose: a controlled stop keeps the logs and the epochs saved so far.
 
 # %%
 import glob, json, os, subprocess, sys
@@ -50,14 +56,24 @@ labels_root = [os.path.dirname(p) for p in glob.glob("/kaggle/input/**/keypoints
 assert images_root and labels_root, f"inputs not found: images {images_root}, labels {labels_root}"
 print("images:", images_root[0], "\nlabels:", labels_root[0])
 
+# Continue from a previous session's weights if they are attached as input, else start from COCO-pose weights.
+previous = sorted(glob.glob("/kaggle/input/**/pitch_session*.pt", recursive=True))
+start = previous[-1] if previous else "yolo11s-pose.pt"
+session = int(os.path.basename(previous[-1])[len("pitch_session"):-3]) + 1 if previous else 1
+print(f"session {session}, starting from {start}")
+
 # %% [markdown]
-# ## Train (3 h budget) and score on the unseen test matches
+# ## Train one 1.25 h session and score on the unseen test matches
 
 # %%
+import shutil
 cmd = [sys.executable, "-u", "/tmp/football/scripts/train_pitch.py", "--images-root", images_root[0],
        "--labels-root", labels_root[0], "--out", "/kaggle/working/pitch", "--work", "/tmp/pitch",
-       "--model", "yolo11s-pose.pt", "--imgsz", "1280", "--batch", "4", "--hours", "3.0", "--deadline-hours", "3.7"]
+       "--model", start, "--imgsz", "1280", "--batch", "4", "--hours", "1.25", "--deadline-hours", "1.9"]
 code = subprocess.run(cmd, cwd="/tmp").returncode       # cwd /tmp: downloaded base weights don't land in the outputs
+best = sorted(glob.glob("/kaggle/working/pitch/pitch_*.pt")) or glob.glob("/kaggle/working/pitch/runs/pitch/weights/best.pt")
+if best:
+    shutil.copy(best[0], f"/kaggle/working/pitch_session{session}.pt")
 if code != 0:
     print(open("/kaggle/working/pitch/train.log").read()[-4000:])
     raise SystemExit(f"pitch training stopped with exit code {code}: see the ERROR line above")
