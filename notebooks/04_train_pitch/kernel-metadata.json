@@ -8,7 +8,7 @@
   "enable_gpu": true,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["hamzadotexe/soccernet-pitch-keypoints"],
+  "dataset_sources": ["hamzadotexe/soccernet-pitch-keypoints", "hamzadotexe/pitch-session-weights"],
   "competition_sources": [],
   "kernel_sources": ["hamzadotexe/soccernet-yolo-dataset"],
   "model_sources": []
