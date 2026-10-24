@@ -18,8 +18,10 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -50,7 +52,7 @@ class Config:
     work: str = "/tmp/pitch"
     model: str = "yolo11s-pose.pt"
     imgsz: int = 1280
-    batch: int = 16
+    batch: int = 4                   # 1280 px pose training: batch 4 peaked at 7.6 GB on a 16 GB T4, batch 8 ran out
     workers: int = 4
     hours: float = 3.0               # training budget (Ultralytics `time`: it fits the LR schedule to it)
     deadline_hours: float = 3.7      # the whole script must finish within this
@@ -58,6 +60,7 @@ class Config:
     test_stride: int = 8             # homography scoring on every 8th test frame (the 828 Roboflow was scored on)
     preflight_fraction: float = 0.05
     min_epochs: int = 4              # stop after the preflight if fewer epochs fit in the budget
+    max_gpu_mem_frac: float = 0.75   # stop after the preflight if training peaks above this share of GPU memory
     device: str = "0"
     smoke: bool = False
 
@@ -105,9 +108,30 @@ def read_results(path: Path) -> list[dict]:
         return [{k.strip(): num(v) for k, v in row.items()} for row in csv.DictReader(f)]
 
 
-def projected_epochs(train_images: int, preflight_images: int, preflight_seconds: float, hours: float) -> float:
-    """Epochs that fit in the budget at the preflight's speed (pessimistic: the preflight includes start-up)."""
-    return hours * 3600 / (preflight_seconds * train_images / max(preflight_images, 1))
+def projected_epochs(train_images: int, images_per_s: float, hours: float, overhead: float = 1.2) -> float:
+    """Epochs that fit in the budget at the measured training speed (+20% for validation and data loading)."""
+    return hours * 3600 / (train_images / images_per_s * overhead)
+
+
+MEMORY_TROUBLE = re.compile(r"out of memory|memory error|reducing to batch", re.I)
+PROGRESS = re.compile(r"^\s*\d+/\d+\s+([\d.]+)G\s.*?([\d.]+)(it/s|s/it)")
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def scan_training_output(text: str) -> dict:
+    """What Ultralytics printed: memory trouble (it silently retries with a smaller batch after running out of GPU
+    memory), peak GPU memory (GB) and the training speed: the median batches/s over its progress lines (the last
+    line alone is slow, it includes the partial final batch)."""
+    peak, rates = None, []
+    for line in text.replace("\r", "\n").splitlines():
+        m = PROGRESS.match(ANSI.sub("", line))
+        if m:
+            peak = max(peak or 0.0, float(m.group(1)))
+            value = float(m.group(2))
+            rates.append(value if m.group(3) == "it/s" else 1 / value)
+    trouble = sorted({m.group(0).lower() for m in MEMORY_TROUBLE.finditer(text)})
+    return {"memory_trouble": trouble, "peak_gpu_gb": peak,
+            "batches_per_s": float(statistics.median(rates)) if rates else None}
 
 
 # ------------------------------------------------------------------------------------------------- child process
@@ -203,16 +227,17 @@ def assemble_data(cfg: Config) -> tuple[Path, Path, dict]:
             check_label_line(lab.read_text().splitlines()[0], len(names))
         (work / split / "images").mkdir(parents=True)
         (work / split / "labels").mkdir(parents=True)
-        found = 0
-        for lab in labels:
-            img = img_dir / f"{lab.stem}.jpg"
-            if img.exists():
-                link(img, work / split / "images" / img.name)
-                shutil.copy(lab, work / split / "labels" / lab.name)
-                found += 1
+        # one directory listing instead of 8,000 existence checks, and links instead of copies: Kaggle's input disk
+        # is slow per file (checking and copying file by file took 39 min in run 2)
+        have = set(os.listdir(img_dir)) if img_dir.is_dir() else set()
+        paired = [lab for lab in labels if f"{lab.stem}.jpg" in have]
+        for lab in paired:
+            link(img_dir / f"{lab.stem}.jpg", work / split / "images" / f"{lab.stem}.jpg")
+            link(lab, work / split / "labels" / lab.name)
+        found = len(paired)
         check(found >= 0.99 * len(labels), f"{split}: only {found} of {len(labels)} labelled frames have an image in {img_dir}")
         counts[split] = found
-        log.info("%s: %d frames (images linked, labels copied)", split, found)
+        log.info("%s: %d frames linked", split, found)
 
     val_list = sorted(str(p) for p in (work / "valid" / "images").glob("*.jpg"))[:: cfg.val_stride]
     (work / "val_subset.txt").write_text("\n".join(val_list))
@@ -228,7 +253,10 @@ def assemble_data(cfg: Config) -> tuple[Path, Path, dict]:
 
 
 def train_args(cfg: Config, data: Path, project: Path, name: str) -> dict:
+    # optimizer set explicitly: "auto" picks AdamW for the short preflight but MuSGD for the long run, so the
+    # preflight would not test the real setup (run 2: the preflight passed, training ran out of GPU memory)
     return dict(mode="train", model=cfg.model, data=str(data), imgsz=cfg.imgsz, batch=cfg.batch, workers=cfg.workers,
+                optimizer="SGD", lr0=0.01, momentum=0.937,
                 device=cfg.device, cache=False, mosaic=0.0, fliplr=0.5, scale=0.3, translate=0.1, degrees=0.0,
                 project=str(project), name=name, exist_ok=True, plots=not cfg.smoke, verbose=True)
 
@@ -236,19 +264,32 @@ def train_args(cfg: Config, data: Path, project: Path, name: str) -> dict:
 def preflight(cfg: Config, pre_yaml: Path, train_images: int, deadline: Deadline) -> None:
     project = Path(cfg.work) / "preflight"
     args = train_args(cfg, pre_yaml, project, "run") | dict(epochs=1, fraction=cfg.preflight_fraction)
-    code, seconds = run_child(args, Path(cfg.out) / "preflight_output.txt", timeout_s=min(20 * 60, deadline.remaining()))
-    check(code is not None, f"preflight hung for {seconds / 60:.0f} min: stopping\n{tail(Path(cfg.out) / 'preflight_output.txt')}")
-    check(code == 0, f"preflight failed (exit {code}):\n{tail(Path(cfg.out) / 'preflight_output.txt')}")
+    out_txt = Path(cfg.out) / "preflight_output.txt"
+    code, seconds = run_child(args, out_txt, timeout_s=min(20 * 60, deadline.remaining()))
+    check(code is not None, f"preflight hung for {seconds / 60:.0f} min: stopping\n{tail(out_txt)}")
+    check(code == 0, f"preflight failed (exit {code}):\n{tail(out_txt)}")
+    seen = scan_training_output(out_txt.read_text(errors="replace"))
+    check(not seen["memory_trouble"], f"preflight ran out of GPU memory at batch {cfg.batch} ({seen['memory_trouble']}): "
+          f"Ultralytics would silently retry with a smaller batch; lower --batch instead")
     rows = read_results(project / "run" / "results.csv")
     check(len(rows) == 1, f"preflight results.csv has {len(rows)} rows, expected 1")
-    losses = {k: v for k, v in rows[0].items() if k.startswith("train/")}
+    losses = {k: round(v, 3) for k, v in rows[0].items() if k.startswith("train/")}
     check(all(math.isfinite(v) for v in losses.values()), f"preflight training losses not finite: {losses}")
-    pre_images = max(1, round(cfg.preflight_fraction * train_images))
-    epochs = projected_epochs(train_images, pre_images, seconds, cfg.hours)
-    log.info("preflight OK in %.1f min (%d frames, 1 epoch incl. start-up): losses %s -> about %.0f+ epochs fit in %.1f h",
-             seconds / 60, pre_images, {k: round(v, 3) for k, v in losses.items()}, epochs, cfg.hours)
-    if not cfg.smoke:
-        check(epochs >= cfg.min_epochs, f"only ~{epochs:.1f} epochs fit in {cfg.hours} h: too slow, stopping before training")
+    log.info("preflight OK in %.1f min: losses %s | peak GPU memory %s GB | %s batches/s", seconds / 60, losses,
+             seen["peak_gpu_gb"], seen["batches_per_s"])
+    if cfg.smoke:
+        return
+    import torch
+    total_gb = torch.cuda.get_device_properties(int(cfg.device)).total_memory / 1e9
+    check(seen["peak_gpu_gb"] is not None and seen["batches_per_s"] is not None,
+          "preflight printed no training progress lines: cannot check memory and speed")
+    check(seen["peak_gpu_gb"] <= cfg.max_gpu_mem_frac * total_gb,
+          f"preflight peaked at {seen['peak_gpu_gb']:.1f} of {total_gb:.1f} GB GPU memory (limit "
+          f"{cfg.max_gpu_mem_frac:.0%}): too close to running out, lower --batch")
+    images_per_s = seen["batches_per_s"] * cfg.batch
+    epochs = projected_epochs(train_images, images_per_s, cfg.hours)
+    log.info("speed %.1f images/s -> about %.0f epochs fit in %.1f h", images_per_s, epochs, cfg.hours)
+    check(epochs >= cfg.min_epochs, f"only ~{epochs:.1f} epochs fit in {cfg.hours} h: too slow, stopping before training")
 
 
 def train(cfg: Config, yaml: Path, deadline: Deadline) -> tuple[Path, dict]:
@@ -267,6 +308,9 @@ def train(cfg: Config, yaml: Path, deadline: Deadline) -> tuple[Path, dict]:
         check(best.exists(), f"training {reason} and saved no weights:\n{tail(out_txt)}")
         log.error("training %s after %.0f min; scoring the saved weights %s (no retraining)\n%s", reason, seconds / 60,
                   best.name, tail(out_txt))
+    trouble = scan_training_output(out_txt.read_text(errors="replace"))["memory_trouble"]
+    if trouble:
+        log.warning("GPU memory trouble during training (%s): Ultralytics may have lowered the batch size mid-run", trouble)
     rows = read_results(project / "pitch" / "results.csv")
     check(len(rows) >= 1, "training finished no epoch")
     key = "metrics/mAP50(P)"

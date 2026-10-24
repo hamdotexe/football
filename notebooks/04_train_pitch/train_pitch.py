@@ -22,7 +22,9 @@
 # ## The model: YOLO11s-pose at 1280 px, on ONE GPU
 # | Setting | Value | Why |
 # |---|---|---|
-# | model | YOLO11s-pose | on one T4, ~12 epochs fit in 3 h vs ~5 for the medium model; resolution and epochs matter more here |
+# | model | YOLO11s-pose | on one T4, ~19 epochs fit in 3 h (measured 17 images/s); resolution and epochs matter more here |
+# | `batch` | 4 | 1280 px pose training peaked at 7.6 GB at batch 4; batch 8 ran out of the T4's 16 GB (gradients are
+# |  |  | accumulated to Ultralytics' nominal batch of 64, so the optimisation is the same) |
 # | `imgsz` | 1280 | landmarks are thin-line crossings: they need pixel-level detail |
 # | `mosaic` | 0 | stitching 4 frames together breaks the pitch's global geometry |
 # | `fliplr` | 0.5 + `flip_idx` | a mirrored frame is valid if left/right landmarks swap names |
@@ -54,7 +56,7 @@ print("images:", images_root[0], "\nlabels:", labels_root[0])
 # %%
 cmd = [sys.executable, "-u", "/tmp/football/scripts/train_pitch.py", "--images-root", images_root[0],
        "--labels-root", labels_root[0], "--out", "/kaggle/working/pitch", "--work", "/tmp/pitch",
-       "--model", "yolo11s-pose.pt", "--imgsz", "1280", "--batch", "16", "--hours", "3.0", "--deadline-hours", "3.7"]
+       "--model", "yolo11s-pose.pt", "--imgsz", "1280", "--batch", "4", "--hours", "3.0", "--deadline-hours", "3.7"]
 code = subprocess.run(cmd, cwd="/tmp").returncode       # cwd /tmp: downloaded base weights don't land in the outputs
 if code != 0:
     print(open("/kaggle/working/pitch/train.log").read()[-4000:])

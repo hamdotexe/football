@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import train_pitch as tp  # noqa: E402
 
-META = json.loads((Path(__file__).resolve().parents[1] / "data" / "pitch_pose" / "keypoints.json").read_text()) \
-    if (Path(__file__).resolve().parents[1] / "data" / "pitch_pose" / "keypoints.json").exists() else None
+KEYPOINTS_JSON = Path(__file__).resolve().parents[1] / "data" / "pitch_pose" / "keypoints.json"
+META = json.loads(KEYPOINTS_JSON.read_text()) if KEYPOINTS_JSON.exists() else None
 
 
 @pytest.mark.skipif(META is None, reason="local pitch labels not present")
@@ -35,8 +35,41 @@ def test_label_line_checks():
 
 
 def test_projected_epochs():
-    # 397 frames took 120 s -> 7944 frames take ~2400 s -> 3 h fit 4.5 epochs
-    assert abs(tp.projected_epochs(7944, 397, 120, 3.0) - 4.5) < 0.05
+    # 17.2 images/s -> 7944 frames in 462 s, +20% for validation -> 3 h fit ~19.5 epochs
+    assert abs(tp.projected_epochs(7944, 17.2, 3.0) - 19.5) < 0.1
+
+
+# real lines from run 2's preflight output (colour codes, carriage-return progress updates, the out-of-memory retry)
+RUN2_LINES = (
+    "\x1b[34m\x1b[1moptimizer:\x1b[0m AdamW(lr=0.002, momentum=0.9) with parameter groups\n"
+    "WARNING ⚠️ CUDA out of memory with batch=16. Reducing to batch=8 and retrying (1/3).\n"
+    "\x1b[K        1/1      7.58G      5.673      11.84     0.7041      51.61       4.94          4       1280: 93% "
+    "━━━ 93/100 4.3it/s 25.9s<1.6s\r"
+    "\x1b[K        1/1      7.62G      5.671      11.84     0.7042       51.9      4.954          1       1280: 99% "
+    "━━━ 99/100 3.1it/s 31.8s<0.3s\n"
+    "\x1b[K\x1b[34m\x1b[1mval: \x1b[0mScanning /tmp/pitch/valid/labels... 1007 images: 75% 1007/1326 92.0it/s 11.2s\n"
+)
+
+
+def test_scan_finds_the_memory_trouble_peak_memory_and_speed_of_run_2():
+    seen = tp.scan_training_output(RUN2_LINES)
+    assert seen["memory_trouble"] == ["out of memory", "reducing to batch"]
+    assert seen["peak_gpu_gb"] == 7.62 and abs(seen["batches_per_s"] - 3.7) < 1e-9   # median of 4.3, 3.1; scan line ignored
+
+
+def test_scan_of_a_clean_run_and_slow_progress():
+    clean = "        3/12      5.10G      1.2      2.3      0.5      0.9      1.1          4       1280: 10% 50/497 1.6s/it 80s<12m\n"
+    seen = tp.scan_training_output(clean)
+    assert seen["memory_trouble"] == [] and seen["peak_gpu_gb"] == 5.1 and abs(seen["batches_per_s"] - 0.625) < 1e-9
+
+
+RUN2_PREFLIGHT = Path(__file__).resolve().parents[1] / "outputs" / "pitch_run2" / "pitch" / "preflight_output.txt"
+
+
+@pytest.mark.skipif(not RUN2_PREFLIGHT.exists(), reason="run 2 outputs not downloaded")
+def test_scan_flags_the_real_run_2_preflight():
+    seen = tp.scan_training_output(RUN2_PREFLIGHT.read_text(errors="replace"))
+    assert seen["memory_trouble"] and seen["peak_gpu_gb"] > 7 and 4.0 <= seen["batches_per_s"] <= 4.5   # ran at ~4.3 it/s
 
 
 def test_read_results_tolerates_padding_and_blank_cells(tmp_path):
