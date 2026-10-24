@@ -32,11 +32,11 @@ def fit_homography(xy: np.ndarray, conf: np.ndarray, conf_threshold: float = 0.5
     return H
 
 
-def frame_scores(pred_xy, pred_conf, gt_xy, gt_vis, conf_threshold: float = 0.5) -> dict:
+def frame_scores(pred_xy, pred_conf, gt_xy, gt_vis, conf_threshold: float = 0.5, ransac_px: float = 10.0) -> dict:
     vis = np.asarray(gt_vis) > 0
     detected = np.asarray(pred_conf) >= conf_threshold
     err = np.linalg.norm(np.float64(pred_xy) - gt_xy, axis=1)
-    H = fit_homography(pred_xy, pred_conf, conf_threshold)
+    H = fit_homography(pred_xy, pred_conf, conf_threshold, ransac_px)
     pitch_err = None
     if H is not None and vis.any():
         try:

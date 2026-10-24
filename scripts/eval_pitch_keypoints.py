@@ -3,7 +3,8 @@
     python scripts/eval_pitch_keypoints.py --weights football-pitch-detection.pt --mapping roboflow \
         --images .../soccernet_yolo/test/images --labels .../test/labels --out outputs/pitch_eval
 
-Writes <out>/metrics.json, per-frame rows (frames.csv), examples.jpg and eval.log. Fail-fast: any failed check logs
+Writes <out>/metrics.json, per-frame rows (frames.csv), the raw predictions (predictions.npz: re-score at any
+confidence threshold without running the model again), examples.jpg and eval.log. Fail-fast: any failed check logs
 the reason and exits with an error; a time budget stops the scoring early and marks the result as partial.
 """
 from __future__ import annotations
@@ -87,7 +88,7 @@ def run(a) -> None:
     expected = 32 if a.mapping == "roboflow" else len(KEYPOINT_NAMES)
     check(n_kp == expected, f"model has {n_kp} keypoints, mapping '{a.mapping}' expects {expected}")
 
-    rows, examples, t0 = [], [], time.time()
+    rows, examples, preds, t0 = [], [], [], time.time()
     example_every = max(1, len(have) // 6)
     for i, lab in enumerate(have):
         if time.time() > deadline:
@@ -100,6 +101,7 @@ def run(a) -> None:
         gt_xy, gt_vis = parse_label(lab.read_text().splitlines()[0], w, h)
         pred_xy, pred_conf = predict(model, img, a.mapping, a.imgsz)
         rows.append({"frame": lab.stem, **frame_scores(pred_xy, pred_conf, gt_xy, gt_vis, a.conf)})
+        preds.append((lab.stem, pred_xy, pred_conf, gt_xy, gt_vis))
         if i % example_every == 0 and len(examples) < 6:
             examples.append(draw_example(img, pred_xy, pred_conf, gt_xy, gt_vis, a.conf))
         if i + 1 == 100:   # sanity: a mapping or label-format bug shows up as homographies that are never found
@@ -114,6 +116,9 @@ def run(a) -> None:
     result = {"weights": Path(a.weights).name, "mapping": a.mapping, "imgsz": a.imgsz, "conf_threshold": a.conf,
               "complete": len(rows) == len(have), **summarise(rows)}
     (out / "metrics.json").write_text(json.dumps(result, indent=2))
+    names, pred_xy, pred_conf, gt_xy, gt_vis = zip(*preds)
+    np.savez_compressed(out / "predictions.npz", frames=np.array(names), pred_xy=np.stack(pred_xy),
+                        pred_conf=np.stack(pred_conf), gt_xy=np.stack(gt_xy), gt_vis=np.stack(gt_vis))
     with open(out / "frames.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["frame", "visible", "detected", "hits", "pitch_err_m"], extrasaction="ignore")
         writer.writeheader()

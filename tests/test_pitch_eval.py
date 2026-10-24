@@ -87,3 +87,16 @@ def test_summary_counts_missing_homographies_as_failures():
             {"visible": 10, "detected": 0, "hits": 0, "errors_px": [], "pitch_err_m": None}]
     s = summarise(rows)
     assert s["homography_found"] == 0.5 and s["frames_within_1m"] == 0.5 and s["keypoint_recall_at_10px"] == 0.45
+
+
+def test_tuning_picks_the_threshold_on_validation_and_scores_test_once(tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import tune_pitch_conf as tune
+    gt = KEYPOINT_XY * (10, 8) + (640, 360)                   # every landmark inside a 1280x720 frame
+    n = len(KEYPOINT_XY)
+    for split in ("val", "test"):                             # exact landmarks, but the model is unsure (conf 0.35)
+        np.savez(tmp_path / f"{split}.npz", frames=np.array(["a", "b"]), pred_xy=np.stack([gt, gt]),
+                 pred_conf=np.full((2, n), 0.35), gt_xy=np.stack([gt, gt]), gt_vis=np.full((2, n), 2.0))
+    r = tune.tune([("s", str(tmp_path / "val.npz"), str(tmp_path / "test.npz"))])
+    assert r["chosen"]["conf"] <= 0.3 and r["chosen_test"]["pitch_error_m_median"] == 0.0
+    assert r["default_test"]["s"]["homography_found"] == 0.0   # at 0.5 no landmark is confident enough
