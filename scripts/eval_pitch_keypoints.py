@@ -38,17 +38,18 @@ def check(ok: bool, message: str) -> None:
         raise RunError(message)
 
 
-def predict(model, img: np.ndarray, mapping: str, imgsz: int) -> tuple[np.ndarray, np.ndarray]:
-    """Best pitch instance -> (33x2 xy, 33 conf) in our keypoint layout; all-zero confidence if nothing found."""
-    r = model(img, imgsz=imgsz, verbose=False)[0]
+def predict(model, img: np.ndarray, mapping: str, imgsz: int, box_conf: float) -> tuple[np.ndarray, np.ndarray, float]:
+    """Best pitch instance -> (33x2 xy, 33 conf) in our keypoint layout and its detection confidence; all-zero if no
+    pitch detection reaches box_conf. A low box_conf is safe: every broadcast frame shows the pitch."""
+    r = model(img, imgsz=imgsz, conf=box_conf, verbose=False)[0]
     if r.keypoints is None or len(r.boxes) == 0:
-        return np.zeros((len(KEYPOINT_NAMES), 2)), np.zeros(len(KEYPOINT_NAMES))
+        return np.zeros((len(KEYPOINT_NAMES), 2)), np.zeros(len(KEYPOINT_NAMES)), 0.0
     best = int(r.boxes.conf.argmax())
     xy, conf = r.keypoints.xy[best].cpu().numpy(), r.keypoints.conf[best].cpu().numpy()
     if mapping == "roboflow":
         from footy.roboflow_pitch import to_our_keypoints
-        return to_our_keypoints(xy, conf)
-    return xy, conf
+        xy, conf = to_our_keypoints(xy, conf)
+    return xy, conf, float(r.boxes.conf[best])
 
 
 def draw_example(img, pred_xy, pred_conf, gt_xy, gt_vis, conf_threshold):
@@ -99,9 +100,9 @@ def run(a) -> None:
         h, w = img.shape[:2]
         check(w == 1280, f"{lab.stem}: image is {w}x{h}, pixel thresholds assume 1280 wide")
         gt_xy, gt_vis = parse_label(lab.read_text().splitlines()[0], w, h)
-        pred_xy, pred_conf = predict(model, img, a.mapping, a.imgsz)
+        pred_xy, pred_conf, box = predict(model, img, a.mapping, a.imgsz, a.box_conf)
         rows.append({"frame": lab.stem, **frame_scores(pred_xy, pred_conf, gt_xy, gt_vis, a.conf)})
-        preds.append((lab.stem, pred_xy, pred_conf, gt_xy, gt_vis))
+        preds.append((lab.stem, pred_xy, pred_conf, box, gt_xy, gt_vis))
         if i % example_every == 0 and len(examples) < 6:
             examples.append(draw_example(img, pred_xy, pred_conf, gt_xy, gt_vis, a.conf))
         if i + 1 == 100:   # sanity: a mapping or label-format bug shows up as homographies that are never found
@@ -113,12 +114,13 @@ def run(a) -> None:
                      (len(have) - i - 1) / rate / 60, json.dumps(summarise(rows)))
 
     check(len(rows) >= a.min_frames, f"only {len(rows)} frames scored before the time budget ran out")
-    result = {"weights": Path(a.weights).name, "mapping": a.mapping, "imgsz": a.imgsz, "conf_threshold": a.conf,
-              "complete": len(rows) == len(have), **summarise(rows)}
+    result = {"weights": Path(a.weights).name, "mapping": a.mapping, "imgsz": a.imgsz, "box_conf": a.box_conf,
+              "conf_threshold": a.conf, "complete": len(rows) == len(have), **summarise(rows)}
     (out / "metrics.json").write_text(json.dumps(result, indent=2))
-    names, pred_xy, pred_conf, gt_xy, gt_vis = zip(*preds)
+    names, pred_xy, pred_conf, box_conf, gt_xy, gt_vis = zip(*preds)
     np.savez_compressed(out / "predictions.npz", frames=np.array(names), pred_xy=np.stack(pred_xy),
-                        pred_conf=np.stack(pred_conf), gt_xy=np.stack(gt_xy), gt_vis=np.stack(gt_vis))
+                        pred_conf=np.stack(pred_conf), box_conf=np.array(box_conf), gt_xy=np.stack(gt_xy),
+                        gt_vis=np.stack(gt_vis))
     with open(out / "frames.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["frame", "visible", "detected", "hits", "pitch_err_m"], extrasaction="ignore")
         writer.writeheader()
@@ -140,6 +142,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--stride", type=int, default=1, help="score every n-th labelled frame")
     ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--box-conf", type=float, default=0.25, help="pitch detection threshold (Ultralytics' default)")
     ap.add_argument("--conf", type=float, default=0.5, help="keypoint confidence threshold")
     ap.add_argument("--max-minutes", type=float, default=30)
     ap.add_argument("--min-frames", type=int, default=50)

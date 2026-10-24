@@ -94,9 +94,12 @@ def test_tuning_picks_the_threshold_on_validation_and_scores_test_once(tmp_path)
     import tune_pitch_conf as tune
     gt = KEYPOINT_XY * (10, 8) + (640, 360)                   # every landmark inside a 1280x720 frame
     n = len(KEYPOINT_XY)
-    for split in ("val", "test"):                             # exact landmarks, but the model is unsure (conf 0.35)
+    for split in ("val", "test"):         # exact landmarks, but the model is unsure of the pitch (0.1) and landmarks (0.35)
         np.savez(tmp_path / f"{split}.npz", frames=np.array(["a", "b"]), pred_xy=np.stack([gt, gt]),
-                 pred_conf=np.full((2, n), 0.35), gt_xy=np.stack([gt, gt]), gt_vis=np.full((2, n), 2.0))
+                 pred_conf=np.full((2, n), 0.35), box_conf=np.array([0.1, 0.1]), gt_xy=np.stack([gt, gt]),
+                 gt_vis=np.full((2, n), 2.0))
     r = tune.tune([("s", str(tmp_path / "val.npz"), str(tmp_path / "test.npz"))])
-    assert r["chosen"]["conf"] <= 0.3 and r["chosen_test"]["pitch_error_m_median"] == 0.0
-    assert r["default_test"]["s"]["homography_found"] == 0.0   # at 0.5 no landmark is confident enough
+    assert r["chosen"]["box_conf"] <= 0.1 and r["chosen"]["conf"] <= 0.3
+    assert r["chosen_test"]["pitch_error_m_median"] == 0.0
+    assert r["default_test"]["s"]["homography_found"] == 0.0   # at the defaults neither the pitch nor a landmark counts
+    assert tune.score(tmp_path / "val.npz", 0.3, 10.0, 0.25)["homography_found"] == 0.0     # pitch below 0.25

@@ -13,6 +13,12 @@
 #
 # The model runs once per frame here; the predictions are saved, and every threshold / RANSAC tolerance is scored from
 # them afterwards (no re-running).
+#
+# ## The bigger catch: frames where the pitch itself isn't "detected"
+# The first tuning run found that 193 of the 195 test frames without a minimap had **no prediction at all**: YOLO-pose
+# first detects the object (here, the pitch) and only reports landmarks for detections above 0.25 confidence, its
+# default. Every broadcast frame shows the pitch, so we keep the best detection however unsure it is
+# (`--box-conf 0.01`) and let validation choose the cut-off (0.01 / 0.05 / 0.1 / 0.25) along with the others.
 
 # %%
 import glob, json, os, subprocess, sys
@@ -52,7 +58,7 @@ for name, (w,) in weights.items():
         out = f"/kaggle/working/tune/{name}/{split}"
         code = subprocess.run([sys.executable, "-u", "/tmp/football/scripts/eval_pitch_keypoints.py", "--weights", w,
                                "--mapping", "ours", "--images", imgs, "--labels", labs, "--out", out, "--stride", stride,
-                               "--imgsz", "1280", "--max-minutes", "40"]).returncode
+                               "--imgsz", "1280", "--box-conf", "0.01", "--max-minutes", "40"]).returncode
         assert code == 0, f"evaluation of {name} on {split} stopped with exit code {code}: see the ERROR line above"
         assert json.load(open(f"{out}/metrics.json"))["complete"], f"{name} {split}: time budget ran out"
 
