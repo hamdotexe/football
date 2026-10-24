@@ -35,11 +35,15 @@
 # 5% of the data for 1 epoch: catches data/config/memory errors in minutes and measures speed), trains in a child
 # process with a hard timeout, and never retrains after a failure: if weights were saved, they are scored.
 #
-# ## Sessions of 1.25 h
-# Two earlier attempts died with **no logs and no outputs at all**: Kaggle killed the whole machine, most likely
-# because RAM ran out during a long session. So training now runs in **sessions of 1.25 h**: each one saves its
-# weights and logs, and the next continues from them. A **watchdog** logs RAM every 2 minutes and, if free RAM drops
-# below 2 GB, stops training on purpose: a controlled stop keeps the logs and the epochs saved so far.
+# ## Short sessions
+# Two earlier attempts died with **no logs and no outputs at all**: Kaggle killed the whole machine. So training runs
+# in **sessions of about 1.3 h**: each one saves its weights and logs, and the next continues from them; the worst
+# case is losing one short session. A **watchdog** logs RAM every 2 minutes and, if free RAM drops below 2 GB, stops
+# training on purpose (a controlled stop keeps the logs and saved epochs). In session 1 RAM stayed flat (27.5 of
+# 32.9 GB free throughout), so running out of RAM is probably not what killed the earlier runs.
+#
+# Before training, the script reads all images once with 64 threads: Kaggle's input disk answers one file at a time
+# slowly (~13 files/s), which cost session 1 ten minutes of Ultralytics scanning files one by one.
 
 # %%
 import glob, json, os, subprocess, sys
@@ -56,20 +60,30 @@ labels_root = [os.path.dirname(p) for p in glob.glob("/kaggle/input/**/keypoints
 assert images_root and labels_root, f"inputs not found: images {images_root}, labels {labels_root}"
 print("images:", images_root[0], "\nlabels:", labels_root[0])
 
-# Continue from a previous session's weights if they are attached as input, else start from COCO-pose weights.
-previous = sorted(glob.glob("/kaggle/input/**/pitch_session*.pt", recursive=True))
+# Continue from the latest session's weights if they are attached as input, else start from COCO-pose weights.
+number = lambda p: int(os.path.basename(p)[len("pitch_session"):-3])
+previous = sorted(glob.glob("/kaggle/input/**/pitch_session*.pt", recursive=True), key=number)
 start = previous[-1] if previous else "yolo11s-pose.pt"
-session = int(os.path.basename(previous[-1])[len("pitch_session"):-3]) + 1 if previous else 1
+session = number(previous[-1]) + 1 if previous else 1
 print(f"session {session}, starting from {start}")
 
 # %% [markdown]
-# ## Train one 1.25 h session and score on the unseen test matches
+# ## Train one session and score on the unseen test matches
+#
+# **Session 1** (train split only, 10 epochs) beat Roboflow on the test clips 116–150 (3.8 m vs 9.0 m) but found
+# almost nothing on clips 187–200, filmed in stadiums the 57 training clips never show. So from session 2 on, the model
+# also trains on the **valid** split (58 more clips, more stadiums), except every 6th clip, which stays out to validate.
+# The **test** split is never trained on: it stays the honest benchmark.
+#
+# A continuing session starts from trained weights, so it needs only a short learning-rate warmup (0.5 epoch, not 3).
 
 # %%
 import shutil
 cmd = [sys.executable, "-u", "/tmp/football/scripts/train_pitch.py", "--images-root", images_root[0],
        "--labels-root", labels_root[0], "--out", "/kaggle/working/pitch", "--work", "/tmp/pitch",
-       "--model", start, "--imgsz", "1280", "--batch", "4", "--hours", "1.25", "--deadline-hours", "1.9"]
+       "--model", start, "--imgsz", "1280", "--batch", "4", "--hours", "1.3", "--deadline-hours", "2.1"]
+if session > 1:
+    cmd += ["--train-on-valid", "--val-stride", "2", "--warmup-epochs", "0.5", "--min-epochs", "3"]
 code = subprocess.run(cmd, cwd="/tmp").returncode       # cwd /tmp: downloaded base weights don't land in the outputs
 best = sorted(glob.glob("/kaggle/working/pitch/pitch_*.pt")) or glob.glob("/kaggle/working/pitch/runs/pitch/weights/best.pt")
 if best:

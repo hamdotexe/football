@@ -79,6 +79,24 @@ def test_read_results_tolerates_padding_and_blank_cells(tmp_path):
     assert rows[1]["metrics/mAP50(P)"] == 0.4 and rows[0]["epoch"] == 1 and rows[0]["metrics/mAP50(P)"] != rows[0]["metrics/mAP50(P)"]
 
 
+def test_holdout_keeps_whole_clips_out_of_training():
+    frames = [Path(f"/w/valid/images/SNGS-0{c}_{i:06d}.jpg") for c in range(21, 33) for i in range(3)]   # 12 clips
+    train, held = tp.split_holdout(frames, 6)
+    assert {tp.clip_of(p) for p in held} == {"SNGS-021", "SNGS-027"}                # every 6th clip, all its frames
+    assert len(held) == 6 and len(train) == 30 and not set(train) & set(held)
+
+
+def test_warm_cache_reads_every_file_and_stops_at_its_time_limit(tmp_path):
+    files = []
+    for i in range(50):
+        files.append(tmp_path / f"{i}.bin")
+        files[-1].write_bytes(b"x" * 1000)
+    seen = tp.warm_cache(files, threads=8, limit_s=60)
+    assert seen["files"] == 50 and seen["of"] == 50 and seen["gb"] == 0.0 and seen["seconds"] < 30
+    seen = tp.warm_cache(files, threads=8, limit_s=-1)         # over the limit at once: gives up after the first file
+    assert seen["files"] == 1 and seen["of"] == 50
+
+
 def test_hung_child_is_killed_at_the_timeout(tmp_path):
     t = time.time()
     code, seconds, reason = tp.run_child({"mode": "sleep", "seconds": 60}, tmp_path / "out.txt", timeout_s=3)

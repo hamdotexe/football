@@ -58,7 +58,12 @@ class Config:
     hours: float = 3.0               # training budget (Ultralytics `time`: it fits the LR schedule to it)
     deadline_hours: float = 3.7      # the whole script must finish within this
     val_stride: int = 6              # validate each epoch on every 6th valid frame (~1,300)
-    test_stride: int = 8             # homography scoring on every 8th test frame (the 828 Roboflow was scored on)
+    test_stride: int = 8             # test scoring on every 8th test frame (the 828 Roboflow was scored on)
+    train_on_valid: bool = False     # also train on the valid split, except every `holdout_every`-th clip (validation)
+    holdout_every: int = 6
+    warmup_epochs: float = 3.0       # Ultralytics' default; a session continuing from trained weights needs less
+    warm_threads: int = 64           # read the data once with many threads before Ultralytics scans it one file at a
+    warm_minutes: float = 10.0       # time (13 files/s on Kaggle's input disk: 10 min per session in session 1)
     preflight_fraction: float = 0.05
     min_epochs: int = 4              # stop after the preflight if fewer epochs fit in the budget
     max_gpu_mem_frac: float = 0.75   # stop after the preflight if training peaks above this share of GPU memory
@@ -110,6 +115,17 @@ def read_results(path: Path) -> list[dict]:
             return float("nan")
     with open(path) as f:
         return [{k.strip(): num(v) for k, v in row.items()} for row in csv.DictReader(f)]
+
+
+def clip_of(path: Path) -> str:
+    return path.name.split("_")[0]           # SNGS-021_000001.jpg -> SNGS-021
+
+
+def split_holdout(images: list[Path], every: int) -> tuple[list[Path], list[Path]]:
+    """Whole clips, not frames: every n-th clip is held out (frames of one clip are near-duplicates, so a held-out
+    frame whose neighbours were trained on would make validation look better than it is). -> (train, held out)"""
+    held = set(sorted({clip_of(p) for p in images})[::every])
+    return [p for p in images if clip_of(p) not in held], [p for p in images if clip_of(p) in held]
 
 
 def projected_epochs(train_images: int, images_per_s: float, hours: float, overhead: float = 1.2) -> float:
@@ -169,6 +185,24 @@ def tree_rss_gb(pid: int) -> float | None:
         total += rss.get(p, 0)
         todo += children.get(p, [])
     return total / 1e9
+
+
+def warm_cache(paths: list[Path], threads: int, limit_s: float) -> dict:
+    """Read every file once, many at a time, so the OS keeps them in memory: Ultralytics' label scan and the first
+    epoch then read from RAM instead of waiting ~0.1 s per file on Kaggle's network disk. Gives up after limit_s
+    (whatever was read is still cached; the rest is read slowly later, as before)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    t, done, size = time.time(), 0, 0
+    pool = ThreadPoolExecutor(threads)
+    try:
+        for f in as_completed([pool.submit(lambda p: len(p.read_bytes()), p) for p in paths]):
+            size += f.result()
+            done += 1
+            if time.time() - t > limit_s:
+                break
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return {"files": done, "of": len(paths), "gb": round(size / 1e9, 2), "seconds": round(time.time() - t, 1)}
 
 
 def dir_size_gb(path: Path) -> float:
@@ -324,16 +358,35 @@ def assemble_data(cfg: Config) -> tuple[Path, Path, dict]:
         counts[split] = found
         log.info("%s: %d frames linked", split, found)
 
-    val_list = sorted(str(p) for p in (work / "valid" / "images").glob("*.jpg"))[:: cfg.val_stride]
-    (work / "val_subset.txt").write_text("\n".join(val_list))
+    train_list = sorted((work / "train" / "images").glob("*.jpg"))
+    valid = sorted((work / "valid" / "images").glob("*.jpg"))
+    if cfg.train_on_valid:
+        extra, held = split_holdout(valid, cfg.holdout_every)
+        check({clip_of(p) for p in extra}.isdisjoint({clip_of(p) for p in held}), "a validation clip is also trained on")
+        train_list += extra
+        val_list = held[:: cfg.val_stride]
+        log.info("training on train + valid: %d frames; validation: %d frames of %d held-out clips %s (every %d-th)",
+                 len(train_list), len(val_list), len({clip_of(p) for p in held}),
+                 sorted({clip_of(p) for p in held}), cfg.val_stride)
+    else:
+        val_list = valid[:: cfg.val_stride]
+        log.info("validation subset: %d frames (every %d-th)", len(val_list), cfg.val_stride)
+    test_list = sorted((work / "test" / "images").glob("*.jpg"))[:: cfg.test_stride]
+    counts["train"] = len(train_list)
+    for name, files in (("train_list", train_list), ("val_subset", val_list), ("val_tiny", val_list[:32]),
+                        ("test_subset", test_list)):
+        (work / f"{name}.txt").write_text("\n".join(str(p) for p in files))
     head = f"kpt_shape: [{len(names)}, 3]\nflip_idx: {flip_idx}\nnames: {{0: pitch}}\n"
     yaml = work / "pitch.yaml"
-    yaml.write_text(f"train: {work}/train/images\nval: {work}/val_subset.txt\ntest: {work}/test/images\n" + head)
+    yaml.write_text(f"train: {work}/train_list.txt\nval: {work}/val_subset.txt\ntest: {work}/test_subset.txt\n" + head)
     # preflight validates on 32 frames only: it checks that validation works, not how good the model is
-    (work / "val_tiny.txt").write_text("\n".join(val_list[:32]))
     pre_yaml = work / "pitch_preflight.yaml"
-    pre_yaml.write_text(f"train: {work}/train/images\nval: {work}/val_tiny.txt\ntest: {work}/test/images\n" + head)
-    log.info("validation subset: %d frames (every %d-th)", len(val_list), cfg.val_stride)
+    pre_yaml.write_text(f"train: {work}/train_list.txt\nval: {work}/val_tiny.txt\ntest: {work}/test_subset.txt\n" + head)
+
+    files = [q for p in train_list + val_list + test_list for q in (p, work / p.parent.parent.name / "labels" / f"{p.stem}.txt")]
+    warmed = warm_cache(files, cfg.warm_threads, cfg.warm_minutes * 60)
+    log.info("read %d of %d files (%.2f GB) into memory in %.1f min (%.0f files/s)", warmed["files"], warmed["of"],
+             warmed["gb"], warmed["seconds"] / 60, warmed["files"] / max(warmed["seconds"], 1e-3))
     return yaml, pre_yaml, counts
 
 
@@ -341,7 +394,7 @@ def train_args(cfg: Config, data: Path, project: Path, name: str) -> dict:
     # optimizer set explicitly: "auto" picks AdamW for the short preflight but MuSGD for the long run, so the
     # preflight would not test the real setup (run 2: the preflight passed, training ran out of GPU memory)
     return dict(mode="train", model=cfg.model, data=str(data), imgsz=cfg.imgsz, batch=cfg.batch, workers=cfg.workers,
-                optimizer="SGD", lr0=0.01, momentum=0.937,
+                optimizer="SGD", lr0=0.01, momentum=0.937, warmup_epochs=cfg.warmup_epochs,
                 device=cfg.device, cache=False, mosaic=0.0, fliplr=0.5, scale=0.3, translate=0.1, degrees=0.0,
                 project=str(project), name=name, exist_ok=True, plots=not cfg.smoke, verbose=True)
 
@@ -430,7 +483,7 @@ def score_test(cfg: Config, best: Path, yaml: Path, deadline: Deadline) -> dict:
         ok, detail = False, "timed out"
     check(ok, f"test homography scoring failed:\n{detail}")
     result["test_homography"] = json.loads((out / "test_eval" / "metrics.json").read_text())
-    # 2) standard pose metrics on the whole test split
+    # 2) standard pose metrics on the same test frames
     pose_json = out / "test_pose_metrics.json"
     args = dict(mode="val", model=str(best), data=str(yaml), split="test", imgsz=cfg.imgsz, batch=cfg.batch,
                 device=cfg.device, project=str(out / "runs"), name="test", exist_ok=True, plots=False, out_json=str(pose_json))
@@ -478,10 +531,16 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=Config.batch)
     ap.add_argument("--hours", type=float, default=Config.hours)
     ap.add_argument("--deadline-hours", type=float, default=Config.deadline_hours)
+    ap.add_argument("--train-on-valid", action="store_true", help="train on valid too, holding out whole clips")
+    ap.add_argument("--val-stride", type=int, default=Config.val_stride)
+    ap.add_argument("--warmup-epochs", type=float, default=Config.warmup_epochs)
+    ap.add_argument("--min-epochs", type=int, default=Config.min_epochs)
     ap.add_argument("--smoke", action="store_true", help="CPU, tiny model and images: exercises every code path")
     a = ap.parse_args()
     cfg = Config(images_root=a.images_root, labels_root=a.labels_root, out=a.out, work=a.work, model=a.model,
-                 imgsz=a.imgsz, batch=a.batch, hours=a.hours, deadline_hours=a.deadline_hours, smoke=a.smoke)
+                 imgsz=a.imgsz, batch=a.batch, hours=a.hours, deadline_hours=a.deadline_hours,
+                 train_on_valid=a.train_on_valid, holdout_every=2 if a.smoke else Config.holdout_every,
+                 val_stride=a.val_stride, warmup_epochs=a.warmup_epochs, min_epochs=a.min_epochs, smoke=a.smoke)
     if cfg.smoke:
         cfg.device, cfg.workers, cfg.preflight_fraction, cfg.test_stride, cfg.val_stride = "cpu", 0, 0.5, 1, 1
         cfg.watch_every_s = 10.0
