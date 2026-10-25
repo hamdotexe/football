@@ -90,6 +90,48 @@ def kick_off_sides(states, t0, t1, min_seen=3, share=0.7):
     return own and sides[0] != sides[1], sides
 
 
+def formation(state, min_players=4, share=0.85, ball_m=12.0):
+    """Kick-off formation in one frame: each team (>= min_players seen) stands in its own half, on opposite sides,
+    and the ball, when seen, is near the centre spot. -> {team: side -1/+1}, or None."""
+    xs = {0: [], 1: []}
+    for _, role, team, x, _ in state["people"]:
+        if role == PLAYER and team in xs and abs(x) >= 1.0:
+            xs[team].append(np.sign(x))
+    if min(len(v) for v in xs.values()) < min_players:
+        return None
+    ball = state.get("ball")
+    if ball is not None and np.hypot(*ball) > ball_m:
+        return None
+    sides = {t: float(np.sign(np.mean(v)) or 1.0) for t, v in xs.items()}
+    if sides[0] == sides[1] or any(np.mean(np.array(v) == sides[t]) < share for t, v in xs.items()):
+        return None
+    return sides
+
+
+def formation_kick_offs(states, min_s=0.6, max_gap_s=0.6, **kw):
+    """Kick-offs from the formation (see `formation`) lasting min_s: after a goal the broadcast often returns from the
+    replay just after the kick, too late to see the ball still on the spot, while the teams are still lined up.
+    The team kicking off plays the ball back into its own half, so it is the team whose half the ball is in."""
+    events, run = [], []
+
+    def close():
+        if run and run[-1][0] - run[0][0] >= min_s:
+            sides = run[0][1]
+            bx = [s["ball"][0] for _, _, s in run if s.get("ball") and abs(s["ball"][0]) >= 1.0]
+            team = next((t for t, side in sides.items() if bx and side == np.sign(np.median(bx))), None)
+            events.append(Event(run[0][0], KICK_OFF, 0.0, 0.0, team, "formation"))
+
+    for s in states:
+        sides = formation(s, **kw)
+        if sides is not None and run and (s["t"] - run[-1][0] > max_gap_s or sides != run[-1][1]):
+            close()
+            run = []
+        if sides is not None:
+            run.append((s["t"], sides, s))
+    close()
+    return events
+
+
 def taker(states, t0, t1, x, y):
     """Team of the player nearest the ball in the last second of a still span (the one about to play it)."""
     best = None
@@ -136,14 +178,17 @@ def restarts(states):
                 continue                            # players of both teams in both halves: not a kick-off
             ev.note = "teams in own halves" if own_halves else "teams not seen"
         events.append(ev)
-    return dedupe(events + throw_ins(states))
+    return dedupe(events + throw_ins(states) + formation_kick_offs(states))
 
 
-def dedupe(events, within_s=8.0):
-    """One event per restart: the same kind again within within_s is the same restart (keep the later one)."""
+def dedupe(events, within_s=8.0, kick_off_within_s=60.0):
+    """One event per restart: the same kind again within within_s is the same restart (keep the later one). Kick-offs
+    are a minute apart at the very least (a goal, its celebration and replays come between), and the formation before
+    one can start long before the kick."""
     out = []
     for ev in sorted(events, key=lambda e: e.t):
-        if out and out[-1].kind == ev.kind and ev.t - out[-1].t <= within_s:
+        window = kick_off_within_s if ev.kind == KICK_OFF else within_s
+        if out and out[-1].kind == ev.kind and ev.t - out[-1].t <= window:
             out[-1] = ev
         else:
             out.append(ev)

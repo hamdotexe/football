@@ -65,3 +65,30 @@ def test_every_kick_off_after_the_first_follows_a_goal_scored_by_the_other_team(
 
 def test_matching_is_one_to_one_within_the_tolerance():
     assert ev.match_events([10, 11, 50], [10.5, 49, 90], tolerance_s=2) == (2, 3, 3)
+
+
+def test_formation_needs_both_teams_in_own_halves_and_the_ball_near_the_centre():
+    people = kickoff_line_up()
+    assert ev.formation({"people": people, "ball": [3.0, 0.0]}) == {0: -1.0, 1: 1.0}
+    assert ev.formation({"people": people, "ball": None}) == {0: -1.0, 1: 1.0}          # ball not seen: still counts
+    assert ev.formation({"people": people, "ball": [20.0, 5.0]}) is None                 # ball far from the centre
+    crossed = people + [(50, ev.PLAYER, 0, 15.0, 0.0), (51, ev.PLAYER, 0, 20.0, 3.0)]   # 2 of 8 of team 0 across
+    assert ev.formation({"people": crossed, "ball": [0.0, 0.0]}) is None
+    assert ev.formation({"people": people[:3] + people[5:], "ball": None}) is None       # too few of team 0 seen
+
+
+def test_kick_off_seen_only_after_the_kick_from_the_formation_and_the_ball_played_back():
+    # back from the replay just after the kick: teams lined up, the ball rolling back into the right half (team 1's)
+    states = frames(0, 20, people=[(1, ev.PLAYER, 0, -30.0, 0.0)]) + \
+        [{"t": round(20.2 + i / FPS, 2), "calibrated": True, "ball": [1.0 + 0.8 * i, 0.5], "holder": None,
+          "people": [list(p) for p in kickoff_line_up()]} for i in range(8)] + \
+        frames(22, 30, ball=[30.0, 10.0], people=[(1, ev.PLAYER, 0, 25.0, 0.0)])
+    found = ev.formation_kick_offs(states)
+    assert [(e.kind, e.t, e.team, e.note) for e in found] == [(ev.KICK_OFF, 20.2, 1, "formation")]
+    assert ev.formation_kick_offs(states[:100] + states[100:103]) == []                   # 0.4 s: too short
+
+
+def test_one_kick_off_however_long_the_line_up_before_it():
+    lined_up, kicked = ev.Event(100.0, ev.KICK_OFF, 0, 0, None, "formation"), ev.Event(130.0, ev.KICK_OFF, 0, 0, 1)
+    assert ev.dedupe([lined_up, kicked]) == [kicked]
+    assert len(ev.dedupe([ev.Event(100.0, ev.CORNER, 52, 34), ev.Event(130.0, ev.CORNER, 52, 34)])) == 2
