@@ -72,6 +72,29 @@ on validation and applied unchanged to the test split (7,331 frames from 49 clip
 - Training: 2.5 h on 2× Tesla T4 (fp16, DataParallel). On T4s, cuDNN crashed with channels-last memory layout under
   DataParallel, so the script probes GPU setups at startup and fell back to the standard layout (59 samples/s).
 
+### Pitch keypoints → homography → minimap (YOLO11s-pose, 1280 px, 33 landmarks)
+
+The model finds 33 pitch landmarks (corners, box corners, penalty spots, centre circle points...); 4 or more give the
+**homography** that maps image pixels to pitch metres. Labels were projected from SoccerNet's player and line
+annotations. Score: map the true landmarks through the predicted homography and measure how many **metres** off they
+land (what the minimap shows). Frames without a homography count as failures.
+
+| Test (828 frames, 49 unseen clips) | params | median minimap error | frames with a minimap | within 2 m |
+|---|---|---|---|---|
+| Roboflow's pretrained pitch model (YOLOv8x-pose, 640 px) | 69.8M | 7.93 m | 89% | 8% |
+| Ours, trained on the `train` split (10 epochs) | 10.5M | 14.4 m | 74% | 34% |
+| **Ours**, + 48 `valid` clips (2 more sessions), tuned inference | 10.5M | **1.19 m** | 88% | **68%** |
+
+- More stadiums mattered most: trained on 57 clips only, it found almost nothing in test clips 187–200 (unfamiliar
+  stadiums, 55.7 m); adding 48 of the `valid` clips brought them to 2.1 m. 10 `valid` clips stay out for validation.
+- Inference settings were chosen on those 10 validation clips, then test was scored once: YOLO-pose only reports
+  landmarks for a pitch detection above 0.25 confidence by default, which dropped the whole pitch in ~25% of frames;
+  every broadcast frame shows the pitch, so it is kept down to 0.01 (landmarks from 0.2, RANSAC 20 px).
+- In video, `SteadyHomography` smooths the view, ignores one-frame jumps unless the next frame confirms them (a camera
+  cut) and bridges gaps of up to 1 s.
+- Training: 3 sessions of ~1.3 h on one Tesla T4 (two earlier long runs died with the whole machine, so training
+  continues from the previous session's weights).
+
 ## Project layout
 
 | Folder | Contents |
