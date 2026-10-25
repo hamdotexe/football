@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import cv2
@@ -25,15 +26,24 @@ def match_teams(detector, videos, device, every_s=30.0):
     return fit_team_classifier(detector, [str(v) for v in videos], stride=int(every_s * fps), device=device)
 
 
-def half_states(video, detector, teams, calibrator, ballnet=None, every=5):
+def check_deadline(deadline, what):
+    """deadline: unix time (or None). Past it, stop with an error instead of starting `what`."""
+    if deadline is not None and time.time() > deadline:
+        raise TimeoutError(f"time budget used up: stopped before {what}")
+
+
+def half_states(video, detector, teams, calibrator, ballnet=None, every=5, deadline=None):
     """The game state of every `every`-th frame of one half (5 per second from 25 fps video). BallNet-L also gets
     the frames just before and after each one."""
     info = sv.VideoInfo.from_video_path(str(video))
     fps = info.fps / every
     calibrator.reset(fps)
     analyze = FrameAnalyzer(detector, teams, fps, calibrator, ballnet)
-    samples = tqdm(sampled_triplets(video, every), total=info.total_frames // every, mininterval=60)
-    return [frame_state(analyze(cur, prev, nxt), i / info.fps) for i, prev, cur, nxt in samples]
+    states = []
+    for i, prev, cur, nxt in tqdm(sampled_triplets(video, every), total=info.total_frames // every, mininterval=60):
+        check_deadline(deadline, f"minute {i / info.fps / 60:.1f} of {Path(video).name}")
+        states.append(frame_state(analyze(cur, prev, nxt), i / info.fps))
+    return states
 
 
 def save_states(path, states):
@@ -153,9 +163,10 @@ def true_score(game_name):
 
 
 def process_match(name, halves, out_dir, detector, calibrator, team_device, ballnet=None, labels=None, render=True,
-                  log=print):
+                  log=print, deadline=None):
     """Teams -> game state of each half -> events and score -> (evaluation) -> clips. Every step's result is saved
-    in out_dir and reused if it is already there, so an interrupted run continues where it stopped."""
+    in out_dir and reused if it is already there, so an interrupted run continues where it stopped. Past `deadline`
+    (unix time) it stops with a TimeoutError; finished halves and clips stay saved."""
     from footy.teams import TeamClassifier
     out = Path(out_dir)
     (out / "clips").mkdir(parents=True, exist_ok=True)
@@ -171,7 +182,12 @@ def process_match(name, halves, out_dir, detector, calibrator, team_device, ball
         if not path.exists():
             log(f"{name}: game state of half {h}")
             tmp = Path(tempfile.gettempdir()) / path.name
-            save_states(tmp, half_states(video, detector, teams, calibrator, ballnet))
+            t0 = time.time()
+            states = half_states(video, detector, teams, calibrator, ballnet, deadline=deadline)
+            dt = time.time() - t0
+            log(f"{name}: half {h}: {len(states)} states in {dt / 60:.1f} min ({len(states) / dt:.1f} per s), "
+                f"minimap in {calibrator.shown / max(calibrator.frames, 1):.0%}")
+            save_states(tmp, states)
             shutil.copy(tmp, path)
         events_by_half[h] = ev.detect(load_states(path))
     goals = [(h, e.t, e.team) for h, es in events_by_half.items() for e in es if e.kind == ev.GOAL]
@@ -187,6 +203,7 @@ def process_match(name, halves, out_dir, detector, calibrator, team_device, ball
         for h, e in pick_clips(events_by_half):
             clip = out / "clips" / f"{h}H_{int(e.t // 60):02d}-{int(e.t % 60):02d}_{e.kind.replace(' ', '-')}.mp4"
             if not clip.exists():
+                check_deadline(deadline, f"clip {clip.name}")
                 render_clip(halves[h - 1], h, e, goals, clip, detector, teams, calibrator, ballnet)
                 log(f"  clip {clip.name}")
     return summary
