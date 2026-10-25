@@ -67,7 +67,12 @@ class PitchCalibrator:
         from ultralytics import YOLO
         self.model = YOLO(weights)
         self.fps, self.imgsz, self.device = fps, imgsz, device
+        self.reset()
+
+    def reset(self):
+        """Start a new video: forget the view, zero the counts."""
         self.steady = None
+        self.frames = self.estimated = self.shown = 0     # frames seen / with their own homography / with a minimap
 
     def estimate(self, frame):
         """This frame's own homography (no smoothing), or None."""
@@ -82,4 +87,9 @@ class PitchCalibrator:
     def __call__(self, frame):
         if self.steady is None:
             self.steady = SteadyHomography(frame.shape[1], frame.shape[0], hold=int(self.fps))
-        return self.steady.update(self.estimate(frame))
+        H = self.estimate(frame)
+        shown = self.steady.update(H)
+        self.frames += 1
+        self.estimated += H is not None
+        self.shown += shown is not None
+        return shown

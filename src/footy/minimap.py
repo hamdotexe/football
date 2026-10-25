@@ -31,11 +31,11 @@ class Minimap:
         return img
 
     @staticmethod
-    def overlay(frame, img, width_frac=0.24, alpha=0.8, margin=12):
-        """Blend the minimap into the bottom centre of a video frame (in place)."""
+    def overlay(frame, img, width_frac=0.24, alpha=0.9, margin=12):
+        """Blend the minimap into the top-left corner of a video frame (in place)."""
         w = int(frame.shape[1] * width_frac)
         img = cv2.resize(img, (w, int(img.shape[0] * w / img.shape[1])), interpolation=cv2.INTER_AREA)
-        y0, x0 = frame.shape[0] - img.shape[0] - margin, (frame.shape[1] - w) // 2
+        y0, x0 = margin, margin
         roi = frame[y0:y0 + img.shape[0], x0:x0 + w]
         roi[:] = cv2.addWeighted(img, alpha, roi, 1 - alpha, 0)
         return frame

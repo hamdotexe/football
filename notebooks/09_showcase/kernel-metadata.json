@@ -1,0 +1,15 @@
+{
+  "id": "hamzadotexe/football-showcase",
+  "title": "football-showcase",
+  "code_file": "showcase.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["hamzadotexe/football-showcase-inputs"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

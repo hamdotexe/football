@@ -1,6 +1,7 @@
 """Detection -> tracking -> team assignment -> annotated video."""
 from collections import Counter, defaultdict
 
+import cv2
 import numpy as np
 import supervision as sv
 from tqdm import tqdm
@@ -67,7 +68,15 @@ def draw_minimap(minimap, H, people, people_colors, ball):
     return img
 
 
-def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None):
+def draw_caption(frame, text, scale=0.9, margin=16):
+    """White text on a dark box, bottom-left (in place)."""
+    (w, h), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    y = frame.shape[0] - margin
+    cv2.rectangle(frame, (margin - 8, y - h - 10), (margin + w + 8, y + base + 4), (0, 0, 0), -1)
+    cv2.putText(frame, text, (margin, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None, caption=None):
     info = sv.VideoInfo.from_video_path(video)
     end = int(info.fps * seconds) if seconds else None
     # ByteTrack: high-confidence detections (>= 0.5) start/extend tracks; low ones (0.1-0.5) can only extend
@@ -134,4 +143,6 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
             if minimap is not None:
                 H = calibrator(frame)
                 Minimap.overlay(out, draw_minimap(minimap, H, shown, [bgr[c] for c in shown.class_id], ball))
+            if caption:
+                draw_caption(out, caption)
             sink.write_frame(out)
