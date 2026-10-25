@@ -67,18 +67,21 @@ def score_at(goals, half, t):
 
 
 def evaluate(events_by_half, labels, tolerance_s=None):
-    """Precision / recall of each kind against SoccerNet's Labels-v2 (visible events for recall)."""
+    """Precision / recall of each kind against SoccerNet's Labels-v2. Recall counts only the events the broadcast
+    shows ("visible"); precision counts a detection as right if it matches any label of its kind, shown or not (most
+    kick-offs after a goal are labelled "not shown": the replay is still on, but the camera may catch its end)."""
     tolerance_s = tolerance_s or {ev.GOAL: 60.0}
     out = {}
     for kind in ev.SOCCERNET_LABEL:
-        m = n_ours = n_truth = 0
+        m = m_any = n_ours = n_truth = 0
         for half, events in events_by_half.items():
-            truth = [t for t, vis in ev.soccernet_events(labels, half, kind) if vis == "visible"]
-            mm, no, nt = ev.match_events([e.t for e in events if e.kind == kind], truth,
-                                         tolerance_s.get(kind, 5.0))
-            m, n_ours, n_truth = m + mm, n_ours + no, n_truth + nt
-        out[kind] = {"found": n_ours, "labelled_visible": n_truth, "matched": m,
-                     "precision": round(m / n_ours, 3) if n_ours else None,
+            ours, labelled = [e.t for e in events if e.kind == kind], ev.soccernet_events(labels, half, kind)
+            tol = tolerance_s.get(kind, 5.0)
+            mm, no, nt = ev.match_events(ours, [t for t, vis in labelled if vis == "visible"], tol)
+            m, m_any, n_ours, n_truth = m + mm, m_any + ev.match_events(ours, [t for t, _ in labelled], tol)[0], \
+                n_ours + no, n_truth + nt
+        out[kind] = {"found": n_ours, "labelled_visible": n_truth, "matched": m, "matched_any": m_any,
+                     "precision": round(m_any / n_ours, 3) if n_ours else None,
                      "recall": round(m / n_truth, 3) if n_truth else None}
     return out
 
