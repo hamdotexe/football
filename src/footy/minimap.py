@@ -29,3 +29,13 @@ class Minimap:
             cv2.circle(img, (int(x), int(y)), radius, tuple(int(v) for v in c), -1, cv2.LINE_AA)
             cv2.circle(img, (int(x), int(y)), radius, outline, 1, cv2.LINE_AA)
         return img
+
+    @staticmethod
+    def overlay(frame, img, width_frac=0.24, alpha=0.8, margin=12):
+        """Blend the minimap into the bottom centre of a video frame (in place)."""
+        w = int(frame.shape[1] * width_frac)
+        img = cv2.resize(img, (w, int(img.shape[0] * w / img.shape[1])), interpolation=cv2.INTER_AREA)
+        y0, x0 = frame.shape[0] - img.shape[0] - margin, (frame.shape[1] - w) // 2
+        roi = frame[y0:y0 + img.shape[0], x0:x0 + w]
+        roi[:] = cv2.addWeighted(img, alpha, roi, 1 - alpha, 0)
+        return frame

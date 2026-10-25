@@ -8,6 +8,8 @@ from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
 from footy.ball import BallTracker
+from footy.minimap import Minimap
+from footy.pitch import HL, HW, project
 from footy.soccernet import CLASS_NAMES
 from footy.teams import TeamClassifier, TrackTeamVotes, goalkeeper_teams, torso_crop
 
@@ -45,7 +47,27 @@ def fit_team_classifier(detector, video, stride=25, device="cpu", max_frames=Non
     return TeamClassifier(device=device).fit(crops)
 
 
-def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True):
+def draw_minimap(minimap, H, people, people_colors, ball):
+    """Players' feet (bottom centre of their boxes) and the ball, mapped onto the pitch with the homography H."""
+    img = minimap.base.copy()
+    if H is None:
+        return img
+
+    def on_pitch(pts):   # drops points the homography sends off the pitch (e.g. a box high in the stands)
+        with np.errstate(all="ignore"):
+            xy = project(H, pts)
+        return xy, np.isfinite(xy).all(1) & (np.abs(xy[:, 0]) <= HL + 5) & (np.abs(xy[:, 1]) <= HW + 5)
+
+    if len(people):
+        xy, keep = on_pitch(people.get_anchors_coordinates(sv.Position.BOTTOM_CENTER))
+        minimap.draw(xy[keep], [c for c, k in zip(people_colors, keep) if k], radius=11, canvas=img)
+    if len(ball):   # the ball's image position is mapped as if on the grass: off when it is in the air
+        xy, keep = on_pitch(ball.get_anchors_coordinates(sv.Position.CENTER))
+        minimap.draw(xy[keep], sv.Color.from_hex(BALL_COLOR).as_bgr(), radius=8, canvas=img)
+    return img
+
+
+def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None):
     info = sv.VideoInfo.from_video_path(video)
     end = int(info.fps * seconds) if seconds else None
     # ByteTrack: high-confidence detections (>= 0.5) start/extend tracks; low ones (0.1-0.5) can only extend
@@ -63,6 +85,8 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
     ball_marker = sv.TriangleAnnotator(color=sv.Color.from_hex(BALL_COLOR), base=22, height=18,
                                        outline_thickness=1)
     trail = sv.TraceAnnotator(color=sv.Color.from_hex(BALL_COLOR), thickness=2, trace_length=int(info.fps))
+    minimap = Minimap() if calibrator is not None else None
+    bgr = [c.as_bgr() for c in palette.colors]
 
     with sv.VideoSink(target, info) as sink:
         for frame in tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames):
@@ -107,4 +131,7 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
                 if ball_trail:
                     out = trail.annotate(out, ball)
                 out = ball_marker.annotate(out, ball)
+            if minimap is not None:
+                H = calibrator(frame)
+                Minimap.overlay(out, draw_minimap(minimap, H, shown, [bgr[c] for c in shown.class_id], ball))
             sink.write_frame(out)
