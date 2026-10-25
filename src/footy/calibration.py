@@ -77,7 +77,7 @@ class PitchCalibrator:
 
     def estimate(self, frame):
         """This frame's own homography (no smoothing), or None."""
-        fp16 = {"half": True} if self.half else {}
+        fp16 = {"quantize": 16} if self.half else {}       # Ultralytics >= 8.4: `half` is deprecated (warns each call)
         r = self.model(frame, imgsz=self.imgsz, conf=BOX_CONF, device=self.device, verbose=False, **fp16)[0]
         if r.keypoints is None or len(r.boxes) == 0:
             return None

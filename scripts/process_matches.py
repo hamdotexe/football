@@ -81,7 +81,8 @@ def main():
         assert not missing, f"input files not found: {missing}"
         out = Path(a.out)
         models = load_models(a)
-        check(jobs[0], out / "_check" / f"device{a.device}", *models, a.check_seconds, a.check_start)
+        # its own folder per worker: every worker sees its GPU as device 0
+        check(jobs[0], out / "_check" / jobs[0]["name"], *models, a.check_seconds, a.check_start)
         for job in jobs:
             labels = json.loads(Path(job["labels"]).read_text()) if job.get("labels") else None
             t0 = time.time()

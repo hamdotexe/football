@@ -32,7 +32,7 @@ class Detector:
         self.class_map = COCO_TO_OURS if len(names) == 80 else {i: i for i in range(len(CLASS_NAMES))}
 
     def __call__(self, frame):
-        fp16 = {"half": True} if self.half else {}
+        fp16 = {"quantize": 16} if self.half else {}       # Ultralytics >= 8.4: `half` is deprecated (warns each call)
         r = self.model(frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False, **fp16)[0]
         det = sv.Detections.from_ultralytics(r)
         det = det[np.isin(det.class_id, list(self.class_map))]
