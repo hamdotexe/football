@@ -15,6 +15,7 @@ import supervision as sv
 from tqdm import tqdm
 
 from footy import events as ev
+from footy.ball import sampled_triplets
 from footy.pipeline import TEAM_COLORS, FrameAnalyzer, annotate_video, fit_team_classifier, frame_state
 
 
@@ -24,15 +25,15 @@ def match_teams(detector, videos, device, every_s=30.0):
     return fit_team_classifier(detector, [str(v) for v in videos], stride=int(every_s * fps), device=device)
 
 
-def half_states(video, detector, teams, calibrator, every=5):
-    """The game state of every `every`-th frame of one half (5 per second from 25 fps video)."""
+def half_states(video, detector, teams, calibrator, ballnet=None, every=5):
+    """The game state of every `every`-th frame of one half (5 per second from 25 fps video). BallNet-L also gets
+    the frames just before and after each one."""
     info = sv.VideoInfo.from_video_path(str(video))
     fps = info.fps / every
     calibrator.reset(fps)
-    analyze = FrameAnalyzer(detector, teams, fps, calibrator)
-    frames = sv.get_video_frames_generator(str(video), stride=every)
-    return [frame_state(analyze(f), k * every / info.fps)
-            for k, f in enumerate(tqdm(frames, total=info.total_frames // every, mininterval=60))]
+    analyze = FrameAnalyzer(detector, teams, fps, calibrator, ballnet)
+    samples = tqdm(sampled_triplets(video, every), total=info.total_frames // every, mininterval=60)
+    return [frame_state(analyze(cur, prev, nxt), i / info.fps) for i, prev, cur, nxt in samples]
 
 
 def save_states(path, states):
@@ -120,8 +121,8 @@ def ffmpeg(*args):
         raise RuntimeError(f"ffmpeg failed: {r.stderr[-800:]}")
 
 
-def render_clip(video, half, event, goals, out_path, detector, teams, calibrator, before=8.0, after=6.0,
-                work=None):
+def render_clip(video, half, event, goals, out_path, detector, teams, calibrator, ballnet=None, before=8.0,
+                after=6.0, work=None):
     """The full pipeline on [event - before, event + after] of a half, with the event's banner and the score.
     Rendered locally, then written to out_path as H.264 (plays in a browser / Google Drive)."""
     work = Path(work or Path(tempfile.gettempdir()) / "clips")
@@ -138,7 +139,7 @@ def render_clip(video, half, event, goals, out_path, detector, teams, calibrator
             draw_banner(frame, BANNER[event.kind], event.team)
 
     calibrator.reset(sv.VideoInfo.from_video_path(str(raw)).fps)
-    annotate_video(detector, teams, str(raw), str(drawn), calibrator=calibrator, extra=extra,
+    annotate_video(detector, teams, str(raw), str(drawn), calibrator=calibrator, extra=extra, ballnet=ballnet,
                    caption=f"{half}H {int(event.t // 60):02d}:{int(event.t % 60):02d}  {BANNER[event.kind]}")
     ffmpeg("-i", drawn, "-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path)
     return Path(out_path)
@@ -151,7 +152,8 @@ def true_score(game_name):
     return (int(m[1]), int(m[2])) if m else None
 
 
-def process_match(name, halves, out_dir, detector, calibrator, team_device, labels=None, render=True, log=print):
+def process_match(name, halves, out_dir, detector, calibrator, team_device, ballnet=None, labels=None, render=True,
+                  log=print):
     """Teams -> game state of each half -> events and score -> (evaluation) -> clips. Every step's result is saved
     in out_dir and reused if it is already there, so an interrupted run continues where it stopped."""
     from footy.teams import TeamClassifier
@@ -169,7 +171,7 @@ def process_match(name, halves, out_dir, detector, calibrator, team_device, labe
         if not path.exists():
             log(f"{name}: game state of half {h}")
             tmp = Path(tempfile.gettempdir()) / path.name
-            save_states(tmp, half_states(video, detector, teams, calibrator))
+            save_states(tmp, half_states(video, detector, teams, calibrator, ballnet))
             shutil.copy(tmp, path)
         events_by_half[h] = ev.detect(load_states(path))
     goals = [(h, e.t, e.team) for h, es in events_by_half.items() for e in es if e.kind == ev.GOAL]
@@ -185,7 +187,7 @@ def process_match(name, halves, out_dir, detector, calibrator, team_device, labe
         for h, e in pick_clips(events_by_half):
             clip = out / "clips" / f"{h}H_{int(e.t // 60):02d}-{int(e.t % 60):02d}_{e.kind.replace(' ', '-')}.mp4"
             if not clip.exists():
-                render_clip(halves[h - 1], h, e, goals, clip, detector, teams, calibrator)
+                render_clip(halves[h - 1], h, e, goals, clip, detector, teams, calibrator, ballnet)
                 log(f"  clip {clip.name}")
     return summary
 

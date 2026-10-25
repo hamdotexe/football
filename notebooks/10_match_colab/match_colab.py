@@ -4,7 +4,8 @@
 # For each match below, this notebook:
 # 1. downloads both halves (720p) from SoccerNet on Hugging Face (needs your `HF_TOKEN` Colab secret)
 # 2. learns the two teams' shirt colours from frames across the whole match
-# 3. runs the pipeline at **5 frames per second** over both halves and keeps the **game state**: where the ball and
+# 3. runs the pipeline at **5 frames per second** over both halves and keeps the **game state**: where the ball (both
+#    ball models merged: the detector on one frame, BallNet-L on three) and
 #    every player are on the pitch (from the minimap's homography), their team and role, who holds the ball
 # 4. finds **events by rules** on that state (no extra model): kick-offs, corners, goal kicks, penalties and
 #    throw-ins from how play restarts, and **goals** from the kick-offs that follow them, which gives the **score**
@@ -15,7 +16,7 @@
 # steps are read back from Drive and skipped.
 #
 # **Before running:** Runtime → Change runtime type → **T4 GPU**; the 🔑 secret `HF_TOKEN` with notebook access;
-# `MyDrive/football/models/` holds `football_yolo11m_1280.pt` and `pitch_keypoints.pt`.
+# `MyDrive/football/models/` holds `football_yolo11m_1280.pt`, `pitch_keypoints.pt` and `ballnet_l.pt`.
 
 # %%
 MATCHES = [
@@ -33,7 +34,7 @@ from google.colab import drive, userdata
 
 drive.mount("/content/drive")
 token = userdata.get("HF_TOKEN")
-models = {name: Path(DRIVE) / "models" / name for name in ("football_yolo11m_1280.pt", "pitch_keypoints.pt")}
+models = {name: Path(DRIVE) / "models" / name for name in ("football_yolo11m_1280.pt", "pitch_keypoints.pt", "ballnet_l.pt")}
 missing = [str(p) for p in models.values() if not p.exists()]
 assert not missing, f"upload these to Google Drive first: {missing}"
 
@@ -50,11 +51,13 @@ sys.path.insert(0, "/content/football/src")
 
 from huggingface_hub import hf_hub_download
 from footy import match as M
+from footy.ball import BallNetDetector
 from footy.calibration import PitchCalibrator
 from footy.pipeline import Detector
 
 detector = Detector(str(models["football_yolo11m_1280.pt"]), device=0, half=True)
 calibrator = PitchCalibrator(str(models["pitch_keypoints.pt"]), device=0, half=True)
+ballnet = BallNetDetector(str(models["ballnet_l.pt"]), device="cuda", half=True)   # merged with the detector's ball
 
 # %%
 summaries = []
@@ -66,7 +69,7 @@ for game in MATCHES:
     labels = json.load(open(hf_hub_download("SoccerNet/SN-Labels", f"{game}/Labels-v2.json", repo_type="dataset")))
     print(f"{name}: downloaded in {time.time() - t0:.0f} s")
     summaries.append(M.process_match(name, halves, Path(DRIVE) / "matches" / name, detector, calibrator, "cuda",
-                                     labels=labels, render=RENDER_CLIPS))
+                                     ballnet=ballnet, labels=labels, render=RENDER_CLIPS))
     shutil.rmtree("/content/videos", ignore_errors=True)
     print(f"{name}: done in {(time.time() - t0) / 60:.0f} min\n")
 

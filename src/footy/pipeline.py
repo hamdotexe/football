@@ -10,7 +10,7 @@ from tqdm import tqdm
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
-from footy.ball import BallTracker
+from footy.ball import BallTracker, fuse_balls, triplets
 from footy.minimap import Minimap
 from footy.pitch import HL, HW, project
 from footy.soccernet import CLASS_NAMES
@@ -92,20 +92,26 @@ class Analysis(NamedTuple):
 class FrameAnalyzer:
     """One frame at a time: detection -> tracking -> roles -> teams -> plausible ball -> pitch homography."""
 
-    def __init__(self, detector, teams, fps, calibrator=None):
+    def __init__(self, detector, teams, fps, calibrator=None, ballnet=None):
         # ByteTrack: high-confidence detections (>= 0.5) start/extend tracks; low ones (0.1-0.5) can only extend
         self.tracker = ByteTrackTracker(frame_rate=fps, lost_track_buffer=int(fps),
                                         track_activation_threshold=0.5, high_conf_det_threshold=0.5)
-        self.detector, self.teams, self.calibrator = detector, teams, calibrator
+        self.detector, self.teams, self.calibrator, self.ballnet = detector, teams, calibrator, ballnet
         self.votes = TrackTeamVotes()
         self.ball_tracker = BallTracker(max_px_per_frame=60.0 * 25 / fps, reacquire_after=int(fps))
         self.role_votes = defaultdict(Counter)   # tracker_id -> votes for player / goalkeeper / referee
 
-    def __call__(self, frame) -> Analysis:
+    def __call__(self, frame, prev=None, nxt=None) -> Analysis:
+        """prev / nxt: the frames just before and after (BallNet-L uses all three); missing ones = this frame."""
         det = self.detector(frame)
 
-        # ball: keep only a physically plausible detection (see footy/ball.py); padded so the marker is visible
-        ball = self.ball_tracker.update(det[(det.class_id == BALL) & (det.confidence >= 0.3)])
+        # ball: the detector's and BallNet-L's candidates merged, then only a physically plausible one is kept (see
+        # footy/ball.py); padded so the marker is visible
+        balls = det[(det.class_id == BALL) & (det.confidence >= 0.3)]
+        if self.ballnet is not None:
+            balls = fuse_balls(balls, self.ballnet(frame if prev is None else prev, frame,
+                                                   frame if nxt is None else nxt))
+        ball = self.ball_tracker.update(balls)
         if len(ball):
             ball.xyxy = sv.pad_boxes(ball.xyxy, px=8)
 
@@ -184,11 +190,12 @@ def frame_state(a: Analysis, t: float) -> dict:
 
 
 def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None, caption=None,
-                   extra=None):
-    """extra: optional callable(frame, t_seconds) that draws more on each output frame (event banners, the score)."""
+                   extra=None, ballnet=None):
+    """extra: optional callable(frame, t_seconds) that draws more on each output frame (event banners, the score).
+    ballnet: optional BallNetDetector, merged with the detector's ball."""
     info = sv.VideoInfo.from_video_path(video)
     end = int(info.fps * seconds) if seconds else None
-    analyze = FrameAnalyzer(detector, teams, info.fps, calibrator)
+    analyze = FrameAnalyzer(detector, teams, info.fps, calibrator, ballnet)
 
     # colour index: 0/1 = teams, 2 = referee
     palette = sv.ColorPalette.from_hex(TEAM_COLORS + [REFEREE_COLOR])
@@ -202,8 +209,9 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
     bgr = [c.as_bgr() for c in palette.colors]
 
     with sv.VideoSink(target, info) as sink:
-        for i, frame in enumerate(tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames)):
-            a = analyze(frame)
+        frames = tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames)
+        for i, (prev, frame, nxt) in enumerate(triplets(frames)):
+            a = analyze(frame, prev, nxt)
             shown = a.people[:]                   # a copy coloured by team instead of role
             shown.class_id = a.color
             out = ellipse.annotate(frame.copy(), shown)
