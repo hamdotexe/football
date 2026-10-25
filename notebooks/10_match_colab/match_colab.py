@@ -24,7 +24,7 @@ MATCHES = [
     "italy_serie-a/2016-2017/2016-10-02 - 19-00 AC Milan 4 - 3 Sassuolo",
 ]
 DRIVE = "/content/drive/MyDrive/football"
-RENDER_CLIPS = True
+RENDER_CLIPS = False   # first run: game state + events + evaluation only; set True once the rules are tuned
 
 # %%
 import json, os, shutil, subprocess, sys, time
