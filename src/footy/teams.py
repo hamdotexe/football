@@ -1,4 +1,5 @@
 """Unsupervised team assignment: torso crops -> SigLIP embeddings -> UMAP -> KMeans(k=2)."""
+import pickle
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -44,6 +45,19 @@ class TeamClassifier:
         if len(crops) == 0:
             return np.zeros(0, dtype=int)
         return self.kmeans.predict(self.reducer.transform(self.embed(crops)))
+
+    def save(self, path):
+        """The fitted clustering only (the SigLIP weights are re-downloaded), so a match keeps the same team ids."""
+        with open(path, "wb") as f:
+            pickle.dump({"reducer": self.reducer, "kmeans": self.kmeans}, f)
+
+    @classmethod
+    def load(cls, path, device="cpu"):
+        tc = cls(device=device)
+        with open(path, "rb") as f:
+            fitted = pickle.load(f)
+        tc.reducer, tc.kmeans = fitted["reducer"], fitted["kmeans"]
+        return tc
 
 
 class TrackTeamVotes:

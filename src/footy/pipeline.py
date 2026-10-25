@@ -1,5 +1,7 @@
-"""Detection -> tracking -> team assignment -> annotated video."""
+"""Detection -> tracking -> team assignment -> pitch positions -> annotated video (or the game state for events)."""
 from collections import Counter, defaultdict
+from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -23,14 +25,15 @@ BALL_COLOR = "#FFFFFF"
 
 
 class Detector:
-    def __init__(self, weights, imgsz=1280, conf=0.1, device=None):
+    def __init__(self, weights, imgsz=1280, conf=0.1, device=None, half=False):
         self.model = YOLO(weights)
-        self.imgsz, self.conf, self.device = imgsz, conf, device
+        self.imgsz, self.conf, self.device, self.half = imgsz, conf, device, half   # half: fp16 on a GPU
         names = self.model.names
         self.class_map = COCO_TO_OURS if len(names) == 80 else {i: i for i in range(len(CLASS_NAMES))}
 
     def __call__(self, frame):
-        r = self.model(frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False)[0]
+        fp16 = {"half": True} if self.half else {}
+        r = self.model(frame, imgsz=self.imgsz, conf=self.conf, device=self.device, verbose=False, **fp16)[0]
         det = sv.Detections.from_ultralytics(r)
         det = det[np.isin(det.class_id, list(self.class_map))]
         det.class_id = np.array([self.class_map[c] for c in det.class_id], dtype=int)
@@ -38,12 +41,14 @@ class Detector:
 
 
 def fit_team_classifier(detector, video, stride=25, device="cpu", max_frames=None):
-    """Collect player torso crops from every `stride`-th frame and cluster them into 2 teams."""
+    """Collect player torso crops from every `stride`-th frame of one video (or a list: both halves of a match) and
+    cluster them into 2 teams."""
     crops = []
-    for i, frame in enumerate(sv.get_video_frames_generator(video, stride=stride, end=max_frames)):
-        players = detector(frame)
-        players = players[(players.class_id == PLAYER) & (players.confidence >= 0.5)]
-        crops += [torso_crop(frame, xyxy) for xyxy in players.xyxy]
+    for v in ([video] if isinstance(video, (str, Path)) else video):
+        for frame in sv.get_video_frames_generator(str(v), stride=stride, end=max_frames):
+            players = detector(frame)
+            players = players[(players.class_id == PLAYER) & (players.confidence >= 0.5)]
+            crops += [torso_crop(frame, xyxy) for xyxy in players.xyxy]
     print(f"fitting team classifier on {len(crops)} player crops")
     return TeamClassifier(device=device).fit(crops)
 
@@ -76,15 +81,114 @@ def draw_caption(frame, text, scale=0.9, margin=16):
     cv2.putText(frame, text, (margin, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None, caption=None):
+class Analysis(NamedTuple):
+    people: sv.Detections      # tracked players, goalkeepers and referees; class_id = role (PLAYER / GOALKEEPER / REFEREE)
+    color: np.ndarray          # per person: 0 / 1 = team, 2 = referee
+    texts: list                # per person: "#12", "GK #3", "REF"
+    ball: sv.Detections        # at most one, physically plausible
+    H: np.ndarray | None       # image -> pitch homography, or None
+
+
+class FrameAnalyzer:
+    """One frame at a time: detection -> tracking -> roles -> teams -> plausible ball -> pitch homography."""
+
+    def __init__(self, detector, teams, fps, calibrator=None):
+        # ByteTrack: high-confidence detections (>= 0.5) start/extend tracks; low ones (0.1-0.5) can only extend
+        self.tracker = ByteTrackTracker(frame_rate=fps, lost_track_buffer=int(fps),
+                                        track_activation_threshold=0.5, high_conf_det_threshold=0.5)
+        self.detector, self.teams, self.calibrator = detector, teams, calibrator
+        self.votes = TrackTeamVotes()
+        self.ball_tracker = BallTracker(max_px_per_frame=60.0 * 25 / fps, reacquire_after=int(fps))
+        self.role_votes = defaultdict(Counter)   # tracker_id -> votes for player / goalkeeper / referee
+
+    def __call__(self, frame) -> Analysis:
+        det = self.detector(frame)
+
+        # ball: keep only a physically plausible detection (see footy/ball.py); padded so the marker is visible
+        ball = self.ball_tracker.update(det[(det.class_id == BALL) & (det.confidence >= 0.3)])
+        if len(ball):
+            ball.xyxy = sv.pad_boxes(ball.xyxy, px=8)
+
+        people = self.tracker.update(det[det.class_id != BALL])
+        people = people[people.tracker_id >= 0]   # drop detections not (yet) part of a confirmed track
+        # role = majority vote over the track's history (the detector is right about a goalkeeper ~half the time
+        # per frame, but over a whole track the majority is reliable, and roles stop flickering)
+        for tid, cls in zip(people.tracker_id, people.class_id):
+            self.role_votes[tid][int(cls)] += 1
+        people.class_id = np.array([self.role_votes[t].most_common(1)[0][0] for t in people.tracker_id], dtype=int)
+
+        players = people[people.class_id == PLAYER]
+        # classify only tracks that still need votes, all in one batched call
+        pending = [(tid, xyxy) for tid, xyxy in zip(players.tracker_id, players.xyxy) if self.votes.needs_vote(tid)]
+        if pending:
+            predictions = self.teams.predict([torso_crop(frame, xyxy) for _, xyxy in pending])
+            for (tid, _), team in zip(pending, predictions):
+                self.votes.add(tid, team)
+        player_teams = np.array([self.votes.team(t) for t in players.tracker_id], dtype=int)
+
+        keepers = people[people.class_id == GOALKEEPER]
+        keeper_teams = goalkeeper_teams(keepers, players, player_teams) if len(keepers) and len(players) else \
+            np.zeros(len(keepers), dtype=int)
+
+        refs = people[people.class_id == REFEREE]
+        texts = [f"#{t}" for t in players.tracker_id] + [f"GK #{t}" for t in keepers.tracker_id] + ["REF"] * len(refs)
+        H = self.calibrator(frame) if self.calibrator is not None else None
+        return Analysis(sv.Detections.merge([players, keepers, refs]),
+                        np.concatenate([player_teams, keeper_teams, np.full(len(refs), 2)]).astype(int), texts, ball, H)
+
+
+def ball_holder(ball_xy, boxes):
+    """Index of the person the ball is on (horizontally within their box, between half a body above the head and
+    the feet) and where on them: rel_y = 0 at the top of the box, 1 at the feet, < 0 above the head. Or None."""
+    if len(boxes) == 0:
+        return None
+    bx, by = ball_xy
+    x1, y1, x2, y2 = boxes.T
+    h = np.maximum(y2 - y1, 1.0)
+    dx = np.maximum.reduce([x1 - bx, np.zeros_like(x1), bx - x2]) / h
+    rel_y = (by - y1) / h
+    ok = (dx <= 0.15) & (rel_y >= -0.5) & (rel_y <= 1.1)
+    if not ok.any():
+        return None
+    i = int(np.flatnonzero(ok)[np.argmin(dx[ok])])
+    return i, float(rel_y[i])
+
+
+def frame_state(a: Analysis, t: float) -> dict:
+    """What the event rules need from one frame, in pitch metres: the ball (mapped as if on the grass, so off when
+    it is in the air), everyone on screen (track id, role, team or -1 for referees, x, y) and who the ball is on
+    (track id, role, team, x, y, rel_y: < 0.2 means at or above the head). Without a homography only t is known."""
+    s = {"t": round(t, 2), "calibrated": a.H is not None, "ball": None, "people": [], "holder": None}
+    if a.H is None:
+        return s
+    with np.errstate(all="ignore"):
+        feet = project(a.H, a.people.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)) if len(a.people) \
+            else np.zeros((0, 2))
+    on_pitch = np.isfinite(feet).all(1) & (np.abs(feet[:, 0]) <= HL + 5) & (np.abs(feet[:, 1]) <= HW + 5)
+
+    def person(i):
+        return [int(a.people.tracker_id[i]), int(a.people.class_id[i]), int(a.color[i]) if a.color[i] < 2 else -1,
+                round(float(feet[i, 0]), 2), round(float(feet[i, 1]), 2)]
+
+    s["people"] = [person(i) for i in np.flatnonzero(on_pitch)]
+    if len(a.ball):
+        centre = a.ball.get_anchors_coordinates(sv.Position.CENTER)
+        with np.errstate(all="ignore"):
+            xy = project(a.H, centre)[0]
+        if np.isfinite(xy).all() and np.abs(xy).max() < 150:
+            s["ball"] = [round(float(xy[0]), 2), round(float(xy[1]), 2)]
+        held = ball_holder(centre[0], a.people.xyxy)
+        if held is not None and on_pitch[held[0]]:
+            s["holder"] = person(held[0]) + [round(held[1], 2)]
+    return s
+
+
+def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None, caption=None,
+                   extra=None):
+    """extra: optional callable(frame, t_seconds) that draws more on each output frame (event banners, the score)."""
     info = sv.VideoInfo.from_video_path(video)
     end = int(info.fps * seconds) if seconds else None
-    # ByteTrack: high-confidence detections (>= 0.5) start/extend tracks; low ones (0.1-0.5) can only extend
-    tracker = ByteTrackTracker(frame_rate=info.fps, lost_track_buffer=int(info.fps),
-                               track_activation_threshold=0.5, high_conf_det_threshold=0.5)
-    votes = TrackTeamVotes()
-    ball_tracker = BallTracker()
-    role_votes = defaultdict(Counter)   # tracker_id -> votes for player / goalkeeper / referee
+    analyze = FrameAnalyzer(detector, teams, info.fps, calibrator)
 
     # colour index: 0/1 = teams, 2 = referee
     palette = sv.ColorPalette.from_hex(TEAM_COLORS + [REFEREE_COLOR])
@@ -98,51 +202,20 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
     bgr = [c.as_bgr() for c in palette.colors]
 
     with sv.VideoSink(target, info) as sink:
-        for frame in tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames):
-            det = detector(frame)
-
-            # ball: keep only a physically plausible detection (see footy/ball.py); padded so the marker is visible
-            ball = ball_tracker.update(det[(det.class_id == BALL) & (det.confidence >= 0.3)])
-            if len(ball):
-                ball.xyxy = sv.pad_boxes(ball.xyxy, px=8)
-
-            people = tracker.update(det[det.class_id != BALL])
-            people = people[people.tracker_id >= 0]   # drop detections not (yet) part of a confirmed track
-            # role = majority vote over the track's history (the detector is right about a goalkeeper ~half the time
-            # per frame, but over a whole track the majority is reliable, and roles stop flickering)
-            for tid, cls in zip(people.tracker_id, people.class_id):
-                role_votes[tid][int(cls)] += 1
-            people.class_id = np.array([role_votes[t].most_common(1)[0][0] for t in people.tracker_id], dtype=int)
-
-            players = people[people.class_id == PLAYER]
-            # classify only tracks that still need votes, all in one batched call
-            pending = [(tid, xyxy) for tid, xyxy in zip(players.tracker_id, players.xyxy) if votes.needs_vote(tid)]
-            if pending:
-                predictions = teams.predict([torso_crop(frame, xyxy) for _, xyxy in pending])
-                for (tid, _), team in zip(pending, predictions):
-                    votes.add(tid, team)
-            player_teams = np.array([votes.team(t) for t in players.tracker_id], dtype=int)
-
-            keepers = people[people.class_id == GOALKEEPER]
-            keeper_teams = goalkeeper_teams(keepers, players, player_teams) if len(keepers) and len(players) else \
-                np.zeros(len(keepers), dtype=int)
-
-            refs = people[people.class_id == REFEREE]
-
-            shown = sv.Detections.merge([players, keepers, refs])
-            shown.class_id = np.concatenate([player_teams, keeper_teams, np.full(len(refs), 2)]).astype(int)
-            texts = ([f"#{t}" for t in players.tracker_id] + [f"GK #{t}" for t in keepers.tracker_id]
-                     + ["REF"] * len(refs))
-
+        for i, frame in enumerate(tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames)):
+            a = analyze(frame)
+            shown = a.people[:]                   # a copy coloured by team instead of role
+            shown.class_id = a.color
             out = ellipse.annotate(frame.copy(), shown)
-            out = label.annotate(out, shown, texts)
-            if len(ball):
+            out = label.annotate(out, shown, a.texts)
+            if len(a.ball):
                 if ball_trail:
-                    out = trail.annotate(out, ball)
-                out = ball_marker.annotate(out, ball)
+                    out = trail.annotate(out, a.ball)
+                out = ball_marker.annotate(out, a.ball)
             if minimap is not None:
-                H = calibrator(frame)
-                Minimap.overlay(out, draw_minimap(minimap, H, shown, [bgr[c] for c in shown.class_id], ball))
+                Minimap.overlay(out, draw_minimap(minimap, a.H, shown, [bgr[c] for c in a.color], a.ball))
             if caption:
                 draw_caption(out, caption)
+            if extra is not None:
+                extra(out, i / info.fps)
             sink.write_frame(out)

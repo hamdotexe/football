@@ -63,20 +63,22 @@ class SteadyHomography:
 class PitchCalibrator:
     """Frame -> steady image->pitch homography (or None), using the pitch keypoint model."""
 
-    def __init__(self, weights, fps=25, imgsz=1280, device=None):
+    def __init__(self, weights, fps=25, imgsz=1280, device=None, half=False):
         from ultralytics import YOLO
         self.model = YOLO(weights)
-        self.fps, self.imgsz, self.device = fps, imgsz, device
+        self.fps, self.imgsz, self.device, self.half = fps, imgsz, device, half
         self.reset()
 
-    def reset(self):
-        """Start a new video: forget the view, zero the counts."""
+    def reset(self, fps=None):
+        """Start a new video (at `fps` analysed frames per second if given): forget the view, zero the counts."""
+        self.fps = fps or self.fps
         self.steady = None
         self.frames = self.estimated = self.shown = 0     # frames seen / with their own homography / with a minimap
 
     def estimate(self, frame):
         """This frame's own homography (no smoothing), or None."""
-        r = self.model(frame, imgsz=self.imgsz, conf=BOX_CONF, device=self.device, verbose=False)[0]
+        fp16 = {"half": True} if self.half else {}
+        r = self.model(frame, imgsz=self.imgsz, conf=BOX_CONF, device=self.device, verbose=False, **fp16)[0]
         if r.keypoints is None or len(r.boxes) == 0:
             return None
         best = int(r.boxes.conf.argmax())
