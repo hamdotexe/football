@@ -49,10 +49,20 @@ jobs = [{"name": name, "halves": [find(f"{key}_1.mkv"), find(f"{key}_2.mkv")], "
         for key, name in MATCHES.items()]
 OUT = Path("/kaggle/working/matches")
 if RENDER_CLIPS:   # run 2: game state + team colours from run 1 (uploaded as a dataset), so only the clips are new
+    import gzip
     for key, name in MATCHES.items():
         (OUT / name).mkdir(parents=True, exist_ok=True)
-        for f in ("teams.pkl", "state_1.jsonl.gz", "state_2.jsonl.gz"):
-            shutil.copy(find(f"{key}_{f}"), OUT / name / f)
+        shutil.copy(find(f"{key}_teams.pkl"), OUT / name / "teams.pkl")
+        for h in (1, 2):               # Kaggle unpacks .gz files of a dataset: <key>_state_1.jsonl/<inner>.jsonl
+            hits = (glob.glob(f"/kaggle/input/**/{key}_state_{h}.jsonl.gz", recursive=True)
+                    + glob.glob(f"/kaggle/input/**/{key}_state_{h}.jsonl/*.jsonl", recursive=True))
+            assert len(hits) == 1, f"state of {key} half {h}: expected exactly 1 input file, found {hits}"
+            if hits[0].endswith(".gz"):
+                shutil.copy(hits[0], OUT / name / f"state_{h}.jsonl.gz")
+            else:
+                with open(hits[0], "rb") as src, gzip.open(OUT / name / f"state_{h}.jsonl.gz", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            assert len(footy.match.load_states(OUT / name / f"state_{h}.jsonl.gz")) > 10000, f"{key} half {h}: too short"
 print(json.dumps(models, indent=1))
 
 # %%
