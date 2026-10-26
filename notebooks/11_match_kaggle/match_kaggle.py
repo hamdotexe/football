@@ -16,8 +16,8 @@
 # Hugging Face repos, which need a token, so they are uploaded rather than fetched here).
 
 # %%
-RENDER_CLIPS = False   # run 1: game state + events + evaluation; run 2 (rules tuned on run 1's states): True
-HOURS = 5.0            # time budget: the workers stop with an error after this (finished halves and clips are kept)
+RENDER_CLIPS = True    # run 1: game state + events + evaluation; run 2 (rules tuned on run 1's states): True
+HOURS = 2.0            # time budget: the workers stop with an error after this (finished halves and clips are kept)
 MATCHES = {            # file prefix in the videos dataset -> SoccerNet game folder name (it holds the real score)
     "barcelona_psg": "2017-03-08 - 22-45 Barcelona 6 - 1 Paris SG",
     "dortmund_leverkusen": "2017-03-04 - 17-30 Dortmund 6 - 2 Bayer Leverkusen",
