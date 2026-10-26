@@ -1,0 +1,16 @@
+{
+  "id": "hamzadotexe/football-full-match",
+  "title": "football-full-match",
+  "code_file": "full_match.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["hamzadotexe/football-showcase-inputs", "hamzadotexe/ballnet-l-weights",
+                      "hamzadotexe/football-match-videos", "hamzadotexe/football-match-states"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

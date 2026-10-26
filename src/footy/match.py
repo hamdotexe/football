@@ -16,8 +16,9 @@ import supervision as sv
 from tqdm import tqdm
 
 from footy import events as ev
-from footy.ball import sampled_triplets
-from footy.pipeline import TEAM_COLORS, FrameAnalyzer, annotate_video, fit_team_classifier, frame_state
+from footy.ball import sampled_triplets, triplets
+from footy.pipeline import (TEAM_COLORS, Annotator, FrameAnalyzer, annotate_video, draw_caption, fit_team_classifier,
+                            frame_state)
 
 
 def match_teams(detector, videos, device, every_s=30.0):
@@ -155,6 +156,81 @@ def render_clip(video, half, event, goals, out_path, detector, teams, calibrator
     annotate_video(detector, teams, str(raw), str(drawn), calibrator=calibrator, extra=extra, ballnet=ballnet,
                    caption=f"{half}H {int(event.t // 60):02d}:{int(event.t % 60):02d}  {BANNER[event.kind]}")
     ffmpeg("-i", drawn, "-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out_path)
+    return Path(out_path)
+
+
+class H264Writer:
+    """Frames -> an H.264 .mp4, encoded by an ffmpeg process as they arrive (it runs alongside the analysis)."""
+
+    def __init__(self, path, fps, width, height, crf=23):
+        self.path = Path(path)
+        self.proc = subprocess.Popen(
+            [ffmpeg_exe(), "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
+             "-r", str(fps), "-i", "-", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt",
+             "yuv420p", str(self.path)], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write(self, frame):
+        self.proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+
+    def close(self):
+        self.proc.stdin.close()
+        err = self.proc.stderr.read().decode(errors="replace")
+        if self.proc.wait() != 0:
+            raise RuntimeError(f"ffmpeg failed writing {self.path}: {err[-800:]}")
+        return self.path
+
+
+def draw_events(frame, t, half, events, goals):
+    """The running score; the banner of an event from 1 s before it to 4 s after; the half and its clock."""
+    draw_score(frame, score_at(goals, half, t))
+    on = [e for e in events if e.t - 1.0 <= t <= e.t + 4.0]
+    if on:
+        e = max(on, key=lambda e: e.t)
+        draw_banner(frame, BANNER[e.kind], e.team)
+    draw_caption(frame, f"{half}H {int(t // 60):02d}:{int(t % 60):02d}")
+
+
+def render_half(video, half, events, goals, out_path, detector, teams, calibrator, ballnet=None, part_s=300.0,
+                deadline=None, work=None, log=print):
+    """A whole half, every frame, through the full pipeline (see footy.pipeline.Annotator), with its events' banners,
+    the running score, the clock and the broadcast's sound, as one H.264 video.
+
+    Written in parts of part_s seconds, then joined: past `deadline` (unix time) it stops, joins the parts done so
+    far into out_path (a shorter video) and raises TimeoutError."""
+    work = Path(work or Path(tempfile.gettempdir()) / f"render_{Path(out_path).stem}")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    info = sv.VideoInfo.from_video_path(str(video))
+    calibrator.reset(info.fps)
+    annotate = Annotator(detector, teams, info.fps, info.width, calibrator, ballnet)
+    per_part = int(round(part_s * info.fps))
+    parts, writer, stopped, written, t0 = [], None, False, 0, time.time()
+    frames = sv.get_video_frames_generator(str(video))
+    for i, (prev, frame, nxt) in enumerate(triplets(frames)):
+        if deadline is not None and time.time() > deadline:
+            stopped = True
+            break
+        if i % per_part == 0:
+            if writer is not None:
+                parts.append(writer.close())
+                log(f"{Path(out_path).name}: {i / info.fps / 60:.0f} min rendered, {i / (time.time() - t0):.1f} frames/s")
+            writer = H264Writer(work / f"part_{len(parts):03d}.mp4", info.fps, info.width, info.height)
+        out = annotate(frame, prev, nxt)
+        draw_events(out, i / info.fps, half, events, goals)
+        writer.write(out)
+        written += 1
+    if writer is not None:
+        parts.append(writer.close())
+    if not written:
+        raise TimeoutError(f"time budget used up before {out_path} began")
+    (work / "parts.txt").write_text("".join(f"file '{p.as_posix()}'\n" for p in parts))
+    ffmpeg("-f", "concat", "-safe", "0", "-i", work / "parts.txt", "-i", video, "-map", "0:v", "-map", "1:a:0?",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-t", f"{written / info.fps:.3f}", "-movflags", "+faststart",
+           out_path)                                    # as long as the frames rendered (the sound stops with them)
+    shutil.rmtree(work, ignore_errors=True)
+    if stopped:
+        raise TimeoutError(f"time budget used up: {out_path} stops at {written / info.fps / 60:.1f} min")
+    log(f"{Path(out_path).name}: done, {written} frames in {(time.time() - t0) / 60:.0f} min")
     return Path(out_path)
 
 

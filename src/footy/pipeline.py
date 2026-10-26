@@ -189,43 +189,54 @@ def frame_state(a: Analysis, t: float) -> dict:
     return s
 
 
+class Annotator:
+    """One video, frame by frame: the analysis (FrameAnalyzer) drawn on the frame. Players and referees ringed in
+    their team's colour with their track id, the ball marked with its trail, the minimap top left."""
+
+    def __init__(self, detector, teams, fps, width, calibrator=None, ballnet=None, ball_trail=True):
+        self.analyze = FrameAnalyzer(detector, teams, fps, calibrator, ballnet)
+        # colour index: 0/1 = teams, 2 = referee
+        palette = sv.ColorPalette.from_hex(TEAM_COLORS + [REFEREE_COLOR])
+        self.ellipse = sv.EllipseAnnotator(color=palette, thickness=2)
+        self.label = sv.LabelAnnotator(color=palette, text_color=sv.Color.BLACK, text_scale=0.45, text_padding=3,
+                                       text_position=sv.Position.BOTTOM_CENTER)
+        self.ball_marker = sv.TriangleAnnotator(color=sv.Color.from_hex(BALL_COLOR), base=22, height=18,
+                                                outline_thickness=1)
+        # the trail: the last second of the ball's path, moved with the camera, drawn only where one smooth curve
+        # explains it (see footy/ball.py: BallTrail); otherwise just the ball
+        self.ball_trail = ball_trail
+        self.camera, self.trail = CameraMotion(), BallTrail(fps, width=width)
+        self.minimap = Minimap() if calibrator is not None else None
+        self.bgr = [c.as_bgr() for c in palette.colors]
+
+    def __call__(self, frame, prev=None, nxt=None):
+        a = self.analyze(frame, prev, nxt)
+        self.trail.update(self.camera(frame) if self.ball_trail else None,
+                          a.ball.get_anchors_coordinates(sv.Position.CENTER)[0] if len(a.ball) else None)
+        shown = a.people[:]                   # a copy coloured by team instead of role
+        shown.class_id = a.color
+        out = self.ellipse.annotate(frame.copy(), shown)
+        out = self.label.annotate(out, shown, a.texts)
+        if len(a.ball):
+            if self.ball_trail:
+                out = draw_trail(out, self.trail.path(), sv.Color.from_hex(BALL_COLOR).as_bgr())
+            out = self.ball_marker.annotate(out, a.ball)
+        if self.minimap is not None:
+            Minimap.overlay(out, draw_minimap(self.minimap, a.H, shown, [self.bgr[c] for c in a.color], a.ball))
+        return out
+
+
 def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True, calibrator=None, caption=None,
                    extra=None, ballnet=None):
     """extra: optional callable(frame, t_seconds) that draws more on each output frame (event banners, the score).
     ballnet: optional BallNetDetector, merged with the detector's ball."""
     info = sv.VideoInfo.from_video_path(video)
     end = int(info.fps * seconds) if seconds else None
-    analyze = FrameAnalyzer(detector, teams, info.fps, calibrator, ballnet)
-
-    # colour index: 0/1 = teams, 2 = referee
-    palette = sv.ColorPalette.from_hex(TEAM_COLORS + [REFEREE_COLOR])
-    ellipse = sv.EllipseAnnotator(color=palette, thickness=2)
-    label = sv.LabelAnnotator(color=palette, text_color=sv.Color.BLACK, text_scale=0.45, text_padding=3,
-                              text_position=sv.Position.BOTTOM_CENTER)
-    ball_marker = sv.TriangleAnnotator(color=sv.Color.from_hex(BALL_COLOR), base=22, height=18,
-                                       outline_thickness=1)
-    # the trail: the last second of the ball's path, moved with the camera, drawn only where one smooth curve explains
-    # it (see footy/ball.py: BallTrail); otherwise just the ball
-    camera, trail = CameraMotion(), BallTrail(info.fps, width=info.width)
-    minimap = Minimap() if calibrator is not None else None
-    bgr = [c.as_bgr() for c in palette.colors]
-
+    annotate = Annotator(detector, teams, info.fps, info.width, calibrator, ballnet, ball_trail)
     with sv.VideoSink(target, info) as sink:
         frames = tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames)
         for i, (prev, frame, nxt) in enumerate(triplets(frames)):
-            a = analyze(frame, prev, nxt)
-            trail.update(camera(frame) if ball_trail else None,
-                         a.ball.get_anchors_coordinates(sv.Position.CENTER)[0] if len(a.ball) else None)
-            shown = a.people[:]                   # a copy coloured by team instead of role
-            shown.class_id = a.color
-            out = ellipse.annotate(frame.copy(), shown)
-            out = label.annotate(out, shown, a.texts)
-            if len(a.ball):
-                if ball_trail:
-                    out = draw_trail(out, trail.path(), sv.Color.from_hex(BALL_COLOR).as_bgr())
-                out = ball_marker.annotate(out, a.ball)
-            if minimap is not None:
-                Minimap.overlay(out, draw_minimap(minimap, a.H, shown, [bgr[c] for c in a.color], a.ball))
+            out = annotate(frame, prev, nxt)
             if caption:
                 draw_caption(out, caption)
             if extra is not None:
