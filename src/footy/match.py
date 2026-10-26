@@ -184,7 +184,7 @@ def process_match(name, halves, out_dir, detector, calibrator, team_device, ball
         path = out / f"state_{h}.jsonl.gz"
         if not path.exists():
             log(f"{name}: game state of half {h}")
-            tmp = Path(tempfile.gettempdir()) / path.name
+            tmp = Path(tempfile.gettempdir()) / f"{out.name}_{path.name}"     # per match: workers run side by side
             t0 = time.time()
             states = half_states(video, detector, teams, calibrator, ballnet, deadline=deadline)
             dt = time.time() - t0
@@ -207,7 +207,8 @@ def process_match(name, halves, out_dir, detector, calibrator, team_device, ball
             clip = out / "clips" / f"{h}H_{int(e.t // 60):02d}-{int(e.t % 60):02d}_{e.kind.replace(' ', '-')}.mp4"
             if not clip.exists():
                 check_deadline(deadline, f"clip {clip.name}")
-                render_clip(halves[h - 1], h, e, goals, clip, detector, teams, calibrator, ballnet)
+                render_clip(halves[h - 1], h, e, goals, clip, detector, teams, calibrator, ballnet,
+                            work=Path(tempfile.gettempdir()) / f"{out.name}_clip")   # per match, as above
                 log(f"  clip {clip.name}")
     return summary
 
