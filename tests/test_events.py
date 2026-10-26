@@ -63,6 +63,18 @@ def test_every_kick_off_after_the_first_follows_a_goal_scored_by_the_other_team(
     assert sorted(e.kind for e in found) == [ev.GOAL, ev.KICK_OFF, ev.KICK_OFF]   # the ball in the net isn't a goal kick
 
 
+def test_a_goal_is_the_ball_over_the_line_then_close_ups_and_the_attacking_team_scores():
+    ends = kickoff_line_up(0)                                                 # team 1 stands further +x
+    play = frames(0, 100, ball=[20.0, 5.0], people=ends)
+    over_the_line = frames(100.2, 101, ball=[52.8, 1.0], people=ends)
+    close_ups = [{"t": round(101.2 + i / FPS, 2), "calibrated": False, "ball": None, "people": [], "holder": None}
+                 for i in range(30 * FPS)]
+    goal = ev.detect(play + over_the_line + close_ups + frames(131.2, 200, ball=[-5.0, 0.0], people=ends))
+    assert [(e.kind, e.t, e.team) for e in goal if e.kind == ev.GOAL] == [(ev.GOAL, 101.0, 0)]   # team 1 defends +x
+    near_miss = ev.detect(play + over_the_line + frames(101.2, 200, ball=[45.0, 10.0], people=ends))  # play goes on
+    assert [e for e in near_miss if e.kind == ev.GOAL] == []
+
+
 def test_matching_is_one_to_one_within_the_tolerance():
     assert ev.match_events([10, 11, 50], [10.5, 49, 90], tolerance_s=2) == (2, 3, 3)
 

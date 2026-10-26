@@ -195,24 +195,84 @@ def dedupe(events, within_s=8.0, kick_off_within_s=60.0):
     return out
 
 
-def goals(states, events, half_start_within_s=600.0, lookback_s=(20.0, 240.0)):
-    """A goal before every kick-off except the one starting the half (the earliest, if within half_start_within_s:
-    a half's video may begin a little before it). The goal's time and end come from the last sighting of the ball in
-    a goal mouth before the kick-off; the scorer is the team that didn't take the kick-off."""
+def in_goal_mouth(ball, depth_m=0.5):
+    return ball is not None and abs(ball[0]) >= HL - depth_m and abs(ball[1]) <= GOAL_HALF_WIDTH + 1.5
+
+
+def defended_ends(states):
+    """{team: +1/-1}: the end each team defends in this half, or {}. Defenders stay goal-side of the ball, so
+    whichever team attacks, the team defending the +x end stands further +x on average than its opponents."""
+    xs = {0: [], 1: []}
+    for s in states:
+        for _, role, team, x, _ in s["people"]:
+            if role == PLAYER and team in xs:
+                xs[team].append(x)
+    if not xs[0] or not xs[1]:
+        return {}
+    end0 = 1.0 if np.mean(xs[0]) > np.mean(xs[1]) else -1.0
+    return {0: end0, 1: -end0}
+
+
+def broadcast_reaction(states, t, window_s=(2, 42), close_up_within_s=60):
+    """What the broadcast shows after time t: (share of the seconds in window_s without live play, i.e. no minimap
+    or no ball; longest run of seconds without a minimap, i.e. close-ups, within close_up_within_s)."""
+    live, wide = set(), set()
+    for s in states:
+        if t < s["t"] <= t + max(window_s[1], close_up_within_s) and s["calibrated"]:
+            wide.add(int(s["t"] - t))
+            if s.get("ball") is not None:
+                live.add(int(s["t"] - t))
+    dead = 1 - np.mean([k in live for k in range(*window_s)])
+    run = longest = 0
+    for k in range(0, close_up_within_s):
+        run = run + 1 if k not in wide else 0
+        longest = max(longest, run)
+    return float(dead), longest
+
+
+def goals(states, events, half_start_within_s=600.0, lookback_s=(20.0, 240.0), cluster_s=10.0, dead_share=0.6,
+          close_up_s=12, one_goal_within_s=120.0):
+    """Goals, from what a broadcast does after one, as the camera rarely shows the kick-off that follows:
+    - the ball seen in a goal mouth (at least once over the line), then celebrations and replays: no live play for
+      most of the next 40 s (dead_share), including close-ups without a pitch view for close_up_s in a row. A near
+      miss that gets replays looks the same: on 3 full matches about half of these were goals;
+    - a kick-off that is seen, other than the one starting the half (the earliest, if within half_start_within_s),
+      follows a goal: the last goal-mouth sighting 20-240 s before it, else a minute before it.
+    The scorer is the team attacking that goal (see defended_ends); without a sighting, the team not kicking off."""
+    ends = defended_ends(states)
+
+    def scorer(goal_x):
+        return next((t for t, end in ends.items() if end == -np.sign(goal_x)), None)
+
+    out, cluster = [], []
+    for s in [s for s in states if in_goal_mouth(s.get("ball"))] + [None]:
+        if s is not None and cluster and s["t"] - cluster[-1]["t"] <= cluster_s:
+            cluster.append(s)
+            continue
+        if cluster and any(abs(c["ball"][0]) >= HL for c in cluster):
+            last = cluster[-1]
+            dead, close_up = broadcast_reaction(states, last["t"])
+            if dead >= dead_share and close_up >= close_up_s:
+                out.append(Event(last["t"], GOAL, last["ball"][0], last["ball"][1], scorer(last["ball"][0]),
+                                 f"ball in the goal mouth, then {close_up} s of close-ups"))
+        cluster = [s]
     kick_offs = sorted((e for e in events if e.kind == KICK_OFF), key=lambda e: e.t)
     if kick_offs and kick_offs[0].t <= half_start_within_s:
         kick_offs = kick_offs[1:]
-    out = []
     for ko in kick_offs:
-        mouth = [s for s in states if s.get("ball") and ko.t - lookback_s[1] <= s["t"] <= ko.t - lookback_s[0]
-                 and abs(s["ball"][0]) >= HL - 0.5 and abs(s["ball"][1]) <= GOAL_HALF_WIDTH + 1.5]
-        scorer = 1 - ko.team if ko.team in (0, 1) else None
+        if any(ko.t - one_goal_within_s <= g.t <= ko.t for g in out):
+            continue
+        mouth = [s for s in states if ko.t - lookback_s[1] <= s["t"] <= ko.t - lookback_s[0]
+                 and in_goal_mouth(s.get("ball"))]
         if mouth:
             m = mouth[-1]
-            out.append(Event(m["t"], GOAL, m["ball"][0], m["ball"][1], scorer, "ball seen in the goal mouth"))
+            out.append(Event(m["t"], GOAL, m["ball"][0], m["ball"][1], scorer(m["ball"][0]),
+                             "kick-off seen; ball last in this goal mouth"))
         else:
-            out.append(Event(ko.t - 60.0, GOAL, 0.0, 0.0, scorer, "time estimated from the kick-off"))
-    return out
+            out.append(Event(ko.t - 60.0, GOAL, 0.0, 0.0, 1 - ko.team if ko.team in (0, 1) else None,
+                             "kick-off seen; time estimated"))
+    out.sort(key=lambda e: e.t)
+    return [g for i, g in enumerate(out) if i == 0 or g.t - out[i - 1].t > one_goal_within_s]
 
 
 def detect(states):
