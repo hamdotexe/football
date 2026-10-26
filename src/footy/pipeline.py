@@ -10,7 +10,7 @@ from tqdm import tqdm
 from trackers import ByteTrackTracker
 from ultralytics import YOLO
 
-from footy.ball import BallTracker, fuse_balls, triplets
+from footy.ball import BallTrail, BallTracker, CameraMotion, draw_trail, fuse_balls, triplets
 from footy.minimap import Minimap
 from footy.pitch import HL, HW, project
 from footy.soccernet import CLASS_NAMES
@@ -204,7 +204,9 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
                               text_position=sv.Position.BOTTOM_CENTER)
     ball_marker = sv.TriangleAnnotator(color=sv.Color.from_hex(BALL_COLOR), base=22, height=18,
                                        outline_thickness=1)
-    trail = sv.TraceAnnotator(color=sv.Color.from_hex(BALL_COLOR), thickness=2, trace_length=int(info.fps))
+    # the trail: the last second of the ball's path, moved with the camera, drawn only where one smooth curve explains
+    # it (see footy/ball.py: BallTrail); otherwise just the ball
+    camera, trail = CameraMotion(), BallTrail(info.fps, width=info.width)
     minimap = Minimap() if calibrator is not None else None
     bgr = [c.as_bgr() for c in palette.colors]
 
@@ -212,13 +214,15 @@ def annotate_video(detector, teams, video, target, seconds=None, ball_trail=True
         frames = tqdm(sv.get_video_frames_generator(video, end=end), total=end or info.total_frames)
         for i, (prev, frame, nxt) in enumerate(triplets(frames)):
             a = analyze(frame, prev, nxt)
+            trail.update(camera(frame) if ball_trail else None,
+                         a.ball.get_anchors_coordinates(sv.Position.CENTER)[0] if len(a.ball) else None)
             shown = a.people[:]                   # a copy coloured by team instead of role
             shown.class_id = a.color
             out = ellipse.annotate(frame.copy(), shown)
             out = label.annotate(out, shown, a.texts)
             if len(a.ball):
                 if ball_trail:
-                    out = trail.annotate(out, a.ball)
+                    out = draw_trail(out, trail.path(), sv.Color.from_hex(BALL_COLOR).as_bgr())
                 out = ball_marker.annotate(out, a.ball)
             if minimap is not None:
                 Minimap.overlay(out, draw_minimap(minimap, a.H, shown, [bgr[c] for c in a.color], a.ball))
